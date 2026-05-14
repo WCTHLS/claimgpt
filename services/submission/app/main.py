@@ -229,6 +229,7 @@ def _extract_gross_total(text: str) -> float | None:
     if not text:
         return None
     patterns = [
+        re.compile(r"(?:total\s*)?gross\s*(?:total\s*)?amount\s*[:|\-]?\s*(?:rs|inr|usd|\$|₹)?\.?\s*([\d,]+\.?\d*)", re.I),
         re.compile(r"gross\s*total\s*[:|\-]?\s*(?:rs|inr|usd|\$|₹)?\.?\s*([\d,]+\.?\d*)", re.I),
         re.compile(r"total\s*amount\s*[:|\-]?\s*(?:rs|inr|usd|\$|₹)?\.?\s*([\d,]+\.?\d*)", re.I),
         re.compile(r"bill\s*summary[\s\S]{0,350}?gross\s*total\s*[:|\-]?\s*(?:rs|inr|usd|\$|₹)?\.?\s*([\d,]+\.?\d*)", re.I),
@@ -370,6 +371,19 @@ def _gather_claim_data_full(db: Session, claim: Claim) -> dict[str, Any]:
 
     # Validations — re-run rules live so preview always reflects current data
     parsed = _build_parsed_field_map(pf_rows)
+    # If parser didn't populate hospital_name, try a lightweight fallback using OCR text
+    if not parsed.get("hospital_name"):
+        try:
+            from services.parser.app.engine import _extract_hospital_name_fallback
+            for did, dtext in doc_ocr_map.items():
+                if not dtext:
+                    continue
+                cand = _extract_hospital_name_fallback(dtext)
+                if cand:
+                    parsed["hospital_name"] = cand
+                    break
+        except Exception:
+            pass
     _codes_for_rules = [{"code": c.code, "code_system": c.code_system, "is_primary": getattr(c, "is_primary", False)} for c in codes]
     _rejection_score = preds[0].rejection_score if preds else None
     _rule_ctx = {"field_map": parsed, "codes": _codes_for_rules, "rejection_score": _rejection_score}
@@ -411,18 +425,91 @@ def _gather_claim_data_full(db: Session, claim: Claim) -> dict[str, Any]:
         "physiotherapy_charges": "Physiotherapy Charges",
         "other_charges": "Other Charges",
     }
+    # Build dynamic, itemized expense lines from parsed field rows (preserve all rows)
     expenses: list[dict[str, Any]] = []
-    seen_expense_labels: dict[str, float] = {}
-    for field_key, display_label in _EXPENSE_FIELDS.items():
-        val = parsed.get(field_key)
-        if val:
+    for r in pf_rows:
+        if not r.field_value:
+            continue
+        fn = (r.field_name or "")
+        mv = (r.model_version or "")
+        # Skip obvious total/grand-total anchors to avoid double-counting
+        if fn in ("total_amount", "gross_total", "total", "grand_total", "gross_total_amount"):
+            continue
+
+        # First, handle structured expense rows stored by the UI (JSON payloads)
+        if mv.startswith("expense-table"):
             try:
-                amount = float(val.replace(",", ""))
-                if amount > 0 and display_label not in seen_expense_labels:
-                    seen_expense_labels[display_label] = amount
-                    expenses.append({"category": display_label, "amount": amount})
-            except (ValueError, AttributeError):
+                import json as _json
+                parsed_json = _json.loads(r.field_value)
+                cat = parsed_json.get("category") if isinstance(parsed_json, dict) else None
+                amt = parsed_json.get("amount") if isinstance(parsed_json, dict) else None
+                if amt is None:
+                    # fallback: try parsing the raw string
+                    try:
+                        amt = float(str(r.field_value).replace(",", ""))
+                    except Exception:
+                        continue
+                if cat is None:
+                    # derive a label from field name if category missing
+                    if fn in _EXPENSE_FIELDS:
+                        cat = _EXPENSE_FIELDS[fn]
+                    else:
+                        cat = re.sub(r"\s+", " ", fn).strip()
+                if float(amt) > 0:
+                    expenses.append({
+                        "category": cat,
+                        "amount": float(amt),
+                        "source_field": fn,
+                        "model_version": mv,
+                        "document_id": str(r.document_id) if getattr(r, "document_id", None) else None,
+                        "source_page": getattr(r, "source_page", None),
+                    })
+            except Exception:
+                # fall back to legacy behaviour if json parsing fails
                 pass
+            continue
+
+        # Legacy heuristics: treat any expense-like parsed field rows as itemized
+        if fn in _EXPENSE_FIELDS or fn.endswith("_expense") or fn.endswith("_charges") or fn.endswith("_charge") or fn.endswith("_amount"):
+            # Determine display label
+            if fn in _EXPENSE_FIELDS:
+                display_label = _EXPENSE_FIELDS[fn]
+            else:
+                display_label = re.sub(r"\s+", " ", fn).strip()
+            try:
+                amount = float((r.field_value or "").replace(",", ""))
+            except (ValueError, AttributeError):
+                continue
+            if amount > 0:
+                expenses.append({
+                    "category": display_label,
+                    "amount": amount,
+                    "source_field": fn,
+                    "model_version": mv,
+                    "document_id": str(r.document_id) if getattr(r, "document_id", None) else None,
+                    "source_page": getattr(r, "source_page", None),
+                })
+
+    # Fallback: if no itemized rows were found, fall back to the previous field-map-based approach
+    if not expenses:
+        seen_expense_labels: dict[str, float] = {}
+        for field_key, val in parsed.items():
+            if not val:
+                continue
+            display_label = None
+            if field_key in _EXPENSE_FIELDS:
+                display_label = _EXPENSE_FIELDS[field_key]
+            elif field_key.endswith("_expense"):
+                display_label = field_key.replace("_expense", "").replace("_", " ").title()
+            if display_label:
+                try:
+                    amount = float(val.replace(",", ""))
+                    if amount > 0 and display_label not in seen_expense_labels:
+                        seen_expense_labels[display_label] = amount
+                        expenses.append({"category": display_label, "amount": amount})
+                except (ValueError, AttributeError):
+                    pass
+
     expense_total = sum(e["amount"] for e in expenses)
 
     gross_total_claimed = 0.0
@@ -1097,6 +1184,64 @@ def revert_claim_field(
         "field_name": field_name,
         "reverted_to": original,
     }
+
+
+@router.put("/claims/{claim_id}/expenses")
+def update_claim_expenses(
+    claim_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+):
+    """
+    Replace itemized expense parsed_fields for a claim with the provided list.
+    Body: {"expenses": [{"category": "Room Charges", "amount": 1234.56}, ...]}
+
+    This stores each row as a ParsedField with model_version="expense-table-ui"
+    so the preview and PDF generation will include the updated itemised rows.
+    """
+    cid = _parse_uuid(claim_id)
+    claim = db.query(Claim).filter(Claim.id == cid).first()
+    if not claim:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    expenses = body.get("expenses") or []
+    if not isinstance(expenses, list):
+        raise HTTPException(status_code=400, detail="expenses must be a list")
+
+    # Delete existing expense-like parsed fields (heuristic)
+    try:
+        del_q = db.query(ParsedField).filter(
+            ParsedField.claim_id == cid,
+            (
+                ParsedField.model_version.ilike("expense-table%")
+            )
+        )
+        deleted = del_q.delete(synchronize_session=False)
+    except Exception:
+        deleted = 0
+
+    import json as _json
+    created = 0
+    for i, e in enumerate(expenses):
+        try:
+            cat = str(e.get("category") or f"Expense {i+1}")[:200]
+            amt = float(e.get("amount") or 0)
+            # Store a single ParsedField per expense with JSON value {category, amount}
+            pf = ParsedField(
+                claim_id=cid,
+                document_id=None,
+                field_name=f"expense_table_row_{i+1}",
+                field_value=_json.dumps({"category": cat, "amount": amt}),
+                model_version="expense-table-ui",
+            )
+            db.add(pf)
+            created += 1
+        except Exception:
+            continue
+
+    db.commit()
+    logger.info("Replaced expenses for claim %s: deleted=%d created=%d", str(cid)[:8], deleted, created)
+    return {"status": "ok", "deleted": deleted, "created": created}
 
 
 @router.get("/claims/{claim_id}/audit")

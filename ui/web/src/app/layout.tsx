@@ -10,7 +10,8 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    // Add the suppression flag here
+    <html lang="en" suppressHydrationWarning>
       <body>
         <LanguageProvider>
           <AuthProvider>{children}</AuthProvider>

@@ -116,6 +116,8 @@ export default function TpaDashboard() {
   const [summaryClaimId, setSummaryClaimId] = useState<string | null>(null);
   const [summaryData, setSummaryData] = useState<ClaimPreviewData | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
+  const [workflowProgress, setWorkflowProgress] = useState<Record<string, { status: string | null; step: string | null; percentage: number; is_complete: boolean }>>({});
+  const [duplicateReportNotice, setDuplicateReportNotice] = useState<string | null>(null);
 
   /* ── Inline chat state ── */
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -260,6 +262,28 @@ export default function TpaDashboard() {
     finally { setExpandedLoading(false); }
   }
 
+  async function openGeneratedClaim(claimId: string, notice?: string) {
+    setDuplicateReportNotice(notice || null);
+    setSummaryClaimId(null);
+    setSummaryData(null);
+    setSummaryLoading(false);
+    setExpandedId(claimId);
+    setExpandedTab("overview");
+    setExpandedLoading(true);
+    setChatMessages([]);
+    setChatInput("");
+    closeDocPreview();
+    chatSessionRef.current = `dash-${claimId}-${Date.now()}`;
+    try {
+      const preview = await apiFetch<ClaimPreviewData>(`${SUBMISSION_API}/claims/${claimId}/preview`, { token });
+      setExpandedPreview(preview);
+    } catch {
+      setExpandedPreview(null);
+    } finally {
+      setExpandedLoading(false);
+    }
+  }
+
   /* ── Bank info card ── */
   function toggleBankCard(claimId: string, e: React.MouseEvent) {
     e.stopPropagation();
@@ -296,11 +320,26 @@ export default function TpaDashboard() {
   async function openSummary(claimId: string, e: React.MouseEvent) {
     e.stopPropagation();
     setSummaryClaimId(claimId); setSummaryData(null); setSummaryLoading(true);
-    try { setSummaryData(await apiFetch<ClaimPreviewData>(`${SUBMISSION_API}/claims/${claimId}/preview`, { token })); }
-    catch { setSummaryData(null); }
+    try {
+      const progress = await apiFetch<{ status: string | null; step: string | null; percentage: number; is_complete: boolean }>(
+        `${API_BASE}/claims/${claimId}/progress`,
+        { token },
+      ).catch(() => null);
+      if (progress && !progress.is_complete && progress.status !== "FAILED") {
+        setWorkflowProgress((prev) => ({ ...prev, [claimId]: progress }));
+        setSummaryData(null);
+        return;
+      }
+      setSummaryData(await apiFetch<ClaimPreviewData>(`${SUBMISSION_API}/claims/${claimId}/preview`, { token }));
+    } catch {
+      setSummaryData(null);
+    }
     finally { setSummaryLoading(false); }
   }
   function closeSummary() { setSummaryClaimId(null); setSummaryData(null); }
+  const activeSummaryProgress = summaryClaimId ? workflowProgress[summaryClaimId] : null;
+  const showSummaryProgressOnly = !!activeSummaryProgress && !activeSummaryProgress.is_complete && activeSummaryProgress.status !== "FAILED";
+  const showAlreadyGeneratedNotice = !!summaryClaimId && !!summaryData && !summaryLoading && !showSummaryProgressOnly;
   async function handleDownloadPdf(claimId: string, type: "irda" | "tpa") {
     try {
       const url = type === "irda" ? `${SUBMISSION_API}/claims/${claimId}/irda-pdf` : `${SUBMISSION_API}/claims/${claimId}/tpa-pdf`;
@@ -346,6 +385,12 @@ export default function TpaDashboard() {
     } catch { setActionFeedback("Action failed. Try again."); }
     finally { setActionSubmitting(false); }
   }
+
+  useEffect(() => {
+    if (!duplicateReportNotice) return;
+    const timer = window.setTimeout(() => setDuplicateReportNotice(null), 3500);
+    return () => window.clearTimeout(timer);
+  }, [duplicateReportNotice]);
 
   /* ── Settlement (maker-checker) ──
      Reviewer flow:  claim status APPROVED -> click "Request Settlement" -> stored locally as PENDING_AUTH
@@ -495,6 +540,12 @@ export default function TpaDashboard() {
     <div className="tpa-dashboard">
 
       {/* ── Page Header ── */}
+      {duplicateReportNotice && (
+        <div className="tpa-alert" style={{ marginBottom: 12 }}>
+          {duplicateReportNotice}
+        </div>
+      )}
+
       <div className="tpa-page-header">
         <div className="tpa-page-header-text">
           <h1 className="tpa-page-title">Claims Dashboard</h1>
@@ -919,10 +970,40 @@ export default function TpaDashboard() {
                 <button className="tpa-modal-close" onClick={closeSummary}>✕</button>
               </div>
 
-              {summaryLoading ? (
-                <div className="tpa-summary-loading"><div className="tpa-loader" /><p>Loading claim details...</p></div>
+              {summaryLoading || showSummaryProgressOnly ? (
+                <div className="tpa-summary-loading" style={{ flexDirection: "column", gap: "0.75rem" }}>
+                  <div className="tpa-loader" />
+                  <p style={{ margin: 0, fontWeight: 600 }}>Report generation in progress</p>
+                  <p style={{ margin: 0, color: "var(--muted)" }}>
+                    {activeSummaryProgress?.step || activeSummaryProgress?.status || "Processing documents"}
+                  </p>
+                  <div style={{ width: "100%", maxWidth: 420, height: 8, borderRadius: 999, background: "rgba(148, 163, 184, 0.18)" }}>
+                    <div
+                      style={{
+                        width: `${activeSummaryProgress?.percentage ?? 0}%`,
+                        height: "100%",
+                        borderRadius: 999,
+                        background: "linear-gradient(90deg, #2563eb, #22c55e)",
+                        transition: "width 250ms ease",
+                      }}
+                    />
+                  </div>
+                  <span style={{ color: "var(--muted)", fontSize: "0.85rem" }}>
+                    {Math.round(activeSummaryProgress?.percentage ?? 0)}% complete
+                  </span>
+                </div>
               ) : summaryData ? (
                 <div className="tpa-summary-body">
+                  {showAlreadyGeneratedNotice && (
+                    <div className="tpa-summary-section tpa-summary-section-full" style={{ marginBottom: 16, border: "1px solid rgba(37, 99, 235, 0.22)", background: "rgba(37, 99, 235, 0.05)" }}>
+                      <h4 className="tpa-summary-heading" style={{ marginBottom: 8 }}>
+                        Report already generated
+                      </h4>
+                      <p style={{ margin: 0, color: "var(--muted)", fontSize: "0.9rem" }}>
+                        This report exists for the uploaded documents. Claim details are shown below for review.
+                      </p>
+                    </div>
+                  )}
                   {/* Patient & Policy */}
                   <div className="tpa-summary-grid">
                     <div className="tpa-summary-section">

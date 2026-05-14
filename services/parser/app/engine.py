@@ -23,10 +23,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
 from urllib import error as urlerror
 from urllib import request as urlrequest
-
 from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 
@@ -47,10 +46,10 @@ class DocumentType(str, Enum):
 @dataclass
 class PageObject:
     page_number: int
-    document_id: str | None
+    document_id: Optional[str]
     raw_text: str
-    detected_tables: list[dict[str, Any]] = field(default_factory=list)
-    coordinates: list[dict[str, Any]] = field(default_factory=list)
+    detected_tables: List[Dict[str, Any]] = field(default_factory=list)
+    coordinates: List[Dict[str, Any]] = field(default_factory=list)
     document_type: str = DocumentType.UNKNOWN.value
 
 # ------------------------------------------------------------------
@@ -149,7 +148,14 @@ class StructuredClaimExtraction(BaseModel):
     patient_name: Optional[str] = None
     member_id: Optional[str] = None
     policy_number: Optional[str] = None
+    claim_number: Optional[str] = None
+    insurer: Optional[str] = None
     age: Optional[int] = None
+    gender: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    address: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
     hospital_name: Optional[str] = None
     admission_date: Optional[str] = None
     discharge_date: Optional[str] = None
@@ -159,6 +165,7 @@ class StructuredClaimExtraction(BaseModel):
     treating_doctor: Optional[str] = None
     claimed_total: Optional[float] = None
     bill_line_items: list[BillingLineItem] = Field(default_factory=list)
+    document_type: Optional[str] = None  # discharge_summary | hospital_bill | prescription | lab_report | other
     notes: Optional[str] = None
     confidence: str = "HIGH"
 
@@ -271,7 +278,7 @@ _DOC_TYPE_FIELD_ALLOWLIST: dict[str, set[str]] = {
     },
     DocumentType.HOSPITAL_BILL.value: {
         "patient_name", "date_of_birth", "age", "gender", "address", "phone", "email",
-        "policy_number", "claim_number", "member_id", "insurer", "hospital_name", "doctor_name",
+        "policy_number", "claim_number", "member_id", "patient_id", "insurer", "hospital_name", "doctor_name",
         "diagnosis", "secondary_diagnosis", "icd_code", "procedure", "cpt_code",
         "admission_date", "discharge_date", "service_date", "total_amount", "room_charges",
         "consultation_charges", "pharmacy_charges", "investigation_charges", "surgery_charges",
@@ -470,9 +477,21 @@ def _build_geometric_tables_from_coords(coords: list[dict[str, Any]], page_num: 
 
 
 def _extract_tables_from_page(text: str, page_num: int, coords: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    # Try geometric first, then text-based, with fuzzy header matching
     base_tables = _build_geometric_tables_from_coords(coords or [], page_num)
     if not base_tables:
         base_tables = _detect_tables(text, page_num)
+    # Fuzzy header rescue: try to find headers even if OCR is noisy
+    for tbl in base_tables:
+        header = tbl.get("header") or []
+        if header and len(header) < 2:
+            # Try to split header row by common delimiters if only one cell
+            hrow = header[0]
+            if isinstance(hrow, str):
+                split = re.split(r"[|,\t]{1,}| {2,}", hrow)
+                if len(split) > 1:
+                    tbl["header"] = [h.strip() for h in split if h.strip()]
+
     if not settings.enable_spatial_table_mapping:
         return base_tables
 
@@ -487,9 +506,10 @@ def _extract_tables_from_page(text: str, page_num: int, coords: list[dict[str, A
         hnorm = [str(h).strip().lower() for h in header]
         align_map: dict[str, int] = {}
         for i, h in enumerate(hnorm):
-            if any(k in h for k in ("qty", "quantity", "days", "units")):
+            # Fuzzy match for quantity/days/units
+            if any(k in h for k in ("qty", "quantity", "days", "units")) or re.search(r"qty|quant|days?|units?", h):
                 align_map["quantity_or_days"] = i
-            if "amount" in h:
+            if "amount" in h or re.search(r"amt|total|charge|price|rs|inr|paid", h):
                 align_map["amount"] = i
             if "rate" in h or "price" in h:
                 align_map["unit_price"] = i
@@ -522,6 +542,7 @@ def _classify_page_document_type(page: PageObject) -> str:
         "expense category", "hospital expense breakdown", "total amount",
         "claim amount requested", "billed total", "itemised total",
         "amount payable", "gross total", "amount exceeding policy",
+        "inpatient hospital bill", "charges statement", "billing summary",
     )
     if any(cue in text for cue in _BILLING_CUES):
         return DocumentType.HOSPITAL_BILL.value
@@ -601,6 +622,231 @@ def _page_objects_to_ocr_pages(page_objects: List[PageObject]) -> List[Dict[str,
 # Public API
 # ------------------------------------------------------------------
 
+# Field names where the LLM agent is preferred over the heuristic
+# (richer, semantically-cleaned narrative content).
+_LLM_PREFERRED_FIELDS: set[str] = {
+    "patient_name",
+    "diagnosis",
+    "primary_diagnosis",
+    "secondary_diagnosis",
+    "procedure",
+    "treating_doctor",
+    "doctor_name",
+    "confidence",
+    "claimed_total",
+    "calculated_total",
+    "total_amount",
+    "notes",
+    "document_type",
+    "insurer",
+    "claim_number",
+    "address",
+    "hospital_name",
+    "gender",
+    "date_of_birth",
+}
+
+
+def _merge_llm_with_heuristic(llm: ParseOutput, heur: ParseOutput) -> ParseOutput:
+    """Smart agent-style merge: LLM wins for narrative/clean fields it populated,\n    heuristic backfills deterministic IDs/dates and supplies the expense table\n    when the LLM didn't extract one.\n    """
+    # ── Field merge ─────────────────────────────────────────────────────────
+    llm_by_name: dict[str, FieldResult] = {}
+    for f in llm.fields:
+        val = (f.field_value or "").strip()
+        if val:
+            llm_by_name.setdefault(f.field_name, f)
+
+    heur_by_name: dict[str, FieldResult] = {}
+    for f in heur.fields:
+        val = (f.field_value or "").strip()
+        if val:
+            heur_by_name.setdefault(f.field_name, f)
+
+    # Did the LLM produce its own line-item table?
+    llm_has_lines = bool(llm.tables)
+
+    merged_fields: list[FieldResult] = []
+    seen: set[str] = set()
+
+    # 1) Multi-value fields like "procedure" can have multiple entries — keep all from LLM
+    multi_value = {"procedure"}
+    for f in llm.fields:
+        if f.field_name in multi_value and (f.field_value or "").strip():
+            merged_fields.append(f)
+            seen.add(f.field_name)
+
+    # 2) LLM-preferred scalar fields: take LLM if present, else heuristic
+    for name in _LLM_PREFERRED_FIELDS:
+        if name in seen:
+            continue
+        if name in llm_by_name:
+            merged_fields.append(llm_by_name[name])
+            seen.add(name)
+        elif name in heur_by_name:
+            merged_fields.append(heur_by_name[name])
+            seen.add(name)
+
+    # 3) All other heuristic fields backfill (member_id, policy_number, dates,
+    #    address, phone, expense line labels). Skip per-line-item expense
+    #    labels if the LLM produced its own table — they'd be duplicates.
+    expense_label_pat = re.compile(
+        r"^(?:room|procedure|consultation|pharmacy|laborator|nursing|consum|miscell|surger|investig|operat|anaest|implant|diagnos|imaging|radiolog)",
+        re.I,
+    )
+    for name, f in heur_by_name.items():
+        if name in seen:
+            continue
+        if llm_has_lines and expense_label_pat.match(name):
+            continue
+        merged_fields.append(f)
+        seen.add(name)
+
+    # 4) Any remaining LLM fields the heuristic didn't have
+    for name, f in llm_by_name.items():
+        if name not in seen:
+            merged_fields.append(f)
+            seen.add(name)
+
+    # ── Tables merge ────────────────────────────────────────────────────────
+    if llm.tables:
+        merged_tables = list(llm.tables)
+    else:
+        merged_tables = list(heur.tables)
+
+    # ── Recompute calculated_total when heuristic supplies the bill ─────────
+    # If the LLM emitted bill_line_items=[] but the heuristic found a real
+    # expense table, the LLM's calculated_total is 0.00 and incorrect. Sum
+    # the heuristic table rows and overwrite calculated_total / total_amount.
+    if not llm.tables and heur.tables:
+        # The heuristic emits multiple tables[] entries: the canonical
+        # normalised one (header = description, category, quantity,
+        # unit_price, amount) plus raw structural tables straight from PDF
+        # detection that include "Total Bill Amount" / "Sum Insured" rows.
+        # Only sum the canonical one to avoid double-counting and totals.
+        canonical_header = {"description", "category", "quantity", "unit_price", "amount"}
+        recomputed_total = 0.0
+        seen_rows: set[tuple[str, float]] = set()
+        for tbl in heur.tables:
+            header = [str(h).strip().lower() for h in (tbl.get("header") or [])]
+            if not canonical_header.issubset(set(header)):
+                continue
+            amount_idx = header.index("amount")
+            desc_idx = header.index("description")
+            for row in tbl.get("rows") or []:
+                if amount_idx >= len(row):
+                    continue
+                raw = str(row[amount_idx]).strip().replace(",", "")
+                m = re.search(r"\d+(?:\.\d+)?", raw)
+                if not m:
+                    continue
+                try:
+                    amt = float(m.group(0))
+                except ValueError:
+                    continue
+                desc = str(row[desc_idx]).strip().lower() if desc_idx < len(row) else ""
+                # Skip total / sum / claimed-amount summary rows that
+                # sometimes leak into structural detections.
+                if re.search(r"\btotal\b|\bsum\b|\bgrand\b|\bclaimed\b|\brequested\b|\bexceeding\b|\bexcess\b|\bnon[-\s]?medical\b", desc, re.I):
+                    continue
+                key = (desc, round(amt, 2))
+                if key in seen_rows:
+                    continue
+                seen_rows.add(key)
+                recomputed_total += amt
+        if recomputed_total > 0:
+            recomputed_str = f"{recomputed_total:.2f}"
+            # Replace existing calculated_total (LLM said 0.00) with our value.
+            patched: list[FieldResult] = []
+            seen_recomputed = False
+            for f in merged_fields:
+                if f.field_name == "calculated_total":
+                    patched.append(FieldResult(
+                        field_name="calculated_total",
+                        field_value=recomputed_str,
+                        source_page=f.source_page,
+                        model_version=f"{f.model_version}+heuristic-total",
+                    ))
+                    seen_recomputed = True
+                else:
+                    patched.append(f)
+            if not seen_recomputed:
+                patched.append(FieldResult(
+                    field_name="calculated_total",
+                    field_value=recomputed_str,
+                    source_page=1,
+                    model_version="heuristic-total",
+                ))
+            # Also fix total_amount if it was 0 and no claimed_total present.
+            def _is_positive_claimed(f: FieldResult) -> bool:
+                if f.field_name != "claimed_total":
+                    return False
+                v = _safe_float(f.field_value)
+                return v is not None and v > 0
+            has_claimed = any(_is_positive_claimed(f) for f in patched)
+            if not has_claimed:
+                final: list[FieldResult] = []
+                replaced_total = False
+                for f in patched:
+                    if f.field_name == "total_amount" and (_safe_float(f.field_value) or 0.0) <= 0.01:
+                        final.append(FieldResult(
+                            field_name="total_amount",
+                            field_value=recomputed_str,
+                            source_page=f.source_page,
+                            model_version=f"{f.model_version}+heuristic-total",
+                        ))
+                        replaced_total = True
+                    else:
+                        final.append(f)
+                patched = final
+            merged_fields = patched
+            # Recompute confidence: if LLM said LOW only because computed_total
+            # was 0, upgrade to MEDIUM when the heuristic total agrees with
+            # claimed_total.
+            for i, f in enumerate(merged_fields):
+                if f.field_name != "confidence":
+                    continue
+                if (f.field_value or "").upper() != "LOW":
+                    break
+                claimed = next(
+                    (_safe_float(g.field_value) for g in merged_fields if g.field_name == "claimed_total"),
+                    None,
+                )
+                if claimed is not None and abs(claimed - recomputed_total) < 1.0:
+                    merged_fields[i] = FieldResult(
+                        field_name="confidence",
+                        field_value="MEDIUM",
+                        source_page=f.source_page,
+                        model_version=f"{f.model_version}+heuristic-total",
+                    )
+                break
+
+    # ── Sections / metadata ─────────────────────────────────────────────────
+    merged_sections = list(llm.sections) + list(heur.sections)
+    page_objects = llm.page_objects or heur.page_objects
+    boundaries = llm.document_boundaries or heur.document_boundaries
+
+    model_version = llm.model_version or "structured-llm"
+    if not llm.tables and heur.tables:
+        model_version = f"{model_version}+heuristic-backfill"
+
+    logger.info(
+        "Agent merge: llm_fields=%d heur_fields=%d → merged=%d, llm_lines=%d heur_lines=%d",
+        len(llm.fields), len(heur.fields), len(merged_fields),
+        sum(t.get("row_count", 0) for t in llm.tables),
+        sum(t.get("row_count", 0) for t in heur.tables),
+    )
+
+    return ParseOutput(
+        fields=merged_fields,
+        tables=merged_tables,
+        sections=merged_sections,
+        page_objects=page_objects,
+        document_boundaries=boundaries,
+        model_version=model_version,
+        used_fallback=False,
+    )
+
+
 def parse_document(
     ocr_pages: List[Dict[str, Any]],
     images: Optional[List[Image.Image]] = None,
@@ -638,6 +884,16 @@ def parse_document(
                 ]
                 structured_output.document_boundaries = document_boundaries
                 _apply_vlm_code_priority(structured_output, routed_pages)
+                # Smart agent merge: always run heuristic to backfill
+                # deterministic fields (member_id, dates, expense table) when
+                # the LLM omits them. The LLM wins for narrative fields it
+                # populated; heuristic supplies everything else.
+                if settings.use_heuristic_fallback:
+                    try:
+                        heuristic_output = _extract_with_heuristic(page_objects)
+                        return _merge_llm_with_heuristic(structured_output, heuristic_output)
+                    except Exception:
+                        logger.exception("Heuristic backfill failed — using LLM output as-is")
                 return structured_output
         except Exception:
             logger.exception("Structured extraction failed — continuing with fallback chain")
@@ -867,17 +1123,57 @@ def _build_structured_prompt(ocr_pages: List[Dict[str, Any]], max_chars: Optiona
         raw_text = raw_text[: effective_max_chars]
 
     return (
-        "You are extracting data from hospital claim documents.\n"
-        "Return ONLY valid JSON for the provided schema.\n"
-        "Hard rules:\n"
-        "1) Do not guess. If a value is not explicitly present, return null.\n"
-        "2) primary_diagnosis must be the reason for admission or principal diagnosis.\n"
-        "3) Extract bill_line_items row-wise from billing tables/statements and preserve table semantics from markdown.\n"
-        "4) Use numeric values for amounts, quantity, and unit_price.\n"
-        "5) confidence must be one of HIGH, MEDIUM, LOW.\n"
-        "6) No markdown, no commentary, no extra keys.\n\n"
-        "Document OCR markdown stream:\n"
-        f"{raw_text}"
+        "You are a medical-claims data extraction expert. Read the OCR text "
+        "of insurance claim documents (hospital bill, discharge summary, "
+        "prescription, lab report, claim form, ID card, etc.) and return ONLY "
+        "the JSON object that matches the provided schema.\n\n"
+        "╔══ ANTI-HALLUCINATION RULES (highest priority) ══╗\n"
+        " 1. EXTRACT ONLY what is LITERALLY written in the OCR text. "
+        "Never invent, paraphrase, translate, complete, or correct names, "
+        "IDs, dates, amounts, diagnoses, or addresses.\n"
+        " 2. If a field is not present, missing, illegible, or you are not "
+        "100%% sure, return null (or [] for list fields). DO NOT GUESS.\n"
+        " 3. Copy values verbatim, preserving original spelling, "
+        "capitalisation, accents and punctuation. Strip leading/trailing "
+        "whitespace and obvious OCR noise (|, *, _, page numbers).\n"
+        " 4. Do not merge unrelated text into one field. e.g. "
+        "hospital_name must be ONLY the hospital name, not the address "
+        "or claim reference suffix.\n"
+        " 5. If the same field appears multiple times with different "
+        "values, prefer the value from the most authoritative section "
+        "(form header > body > footer) and lower `confidence` to MEDIUM.\n"
+        "\n╔══ FIELD SEMANTICS ══╗\n"
+        " • patient_name: the patient/insured person, never the doctor, "
+        "TPA, insurer, nominee or proposer.\n"
+        " • treating_doctor: doctor's name only (no degrees / reg numbers).\n"
+        " • primary_diagnosis: principal reason for admission/visit.\n"
+        " • secondary_diagnosis: comma-separated co-morbidities, if any.\n"
+        " • procedures: list of distinct procedure / treatment / surgery "
+        "names performed.\n"
+        " • admission_date / discharge_date / date_of_birth: keep the "
+        "original format from the document (do not reformat).\n"
+        " • claimed_total: the explicit grand total / total amount payable, "
+        "as a number (no currency symbol).\n"
+        " • document_type: pick one of discharge_summary | hospital_bill | "
+        "prescription | lab_report | claim_form | id_card | other based on "
+        "the dominant content.\n"
+        "\n╔══ BILL LINE ITEMS ══╗\n"
+        " • If the document HAS a billing table or itemised charges, extract "
+        "each row as one bill_line_items entry with description, optional "
+        "quantity / unit_price, and the row total as `amount` (number).\n"
+        " • NEVER invent line items. If there is no itemised table, return "
+        "bill_line_items as [].\n"
+        " • Skip subtotal / total / tax / grand-total rows — those belong "
+        "in claimed_total only.\n"
+        "\n╔══ OUTPUT ══╗\n"
+        " • Return ONLY the JSON object. No prose, no markdown fences, no "
+        "comments, no extra keys.\n"
+        " • confidence is HIGH only if every populated field is unambiguous; "
+        "otherwise MEDIUM, and LOW if multiple fields had to be guessed or "
+        "the OCR is very noisy.\n\n"
+        "==== OCR TEXT START ====\n"
+        f"{raw_text}\n"
+        "==== OCR TEXT END ===="
     )
 
 
@@ -1032,9 +1328,30 @@ def _extract_with_structured_llm(ocr_pages: List[Dict[str, Any]]) -> Optional[Pa
     add_field("patient_name", extraction.patient_name, model_version)
     if extraction.age is not None:
         add_field("age", str(extraction.age), model_version)
+    add_field("gender", extraction.gender, model_version)
+    add_field("date_of_birth", extraction.date_of_birth, model_version)
+    add_field("address", extraction.address, model_version)
+    add_field("phone", extraction.phone, model_version)
+    add_field("email", extraction.email, model_version)
     add_field("member_id", extraction.member_id, model_version)
     add_field("policy_number", extraction.policy_number, model_version)
-    add_field("hospital_name", extraction.hospital_name, model_version)
+    add_field("claim_number", extraction.claim_number, model_version)
+    add_field("insurer", extraction.insurer, model_version)
+    add_field("document_type", extraction.document_type, model_version)
+    # Strip trailing OCR streams like "... | Claim Ref: ... | Planned" from
+    # the LLM hospital_name — pick the segment containing a provider keyword.
+    cleaned_hospital = extraction.hospital_name
+    if cleaned_hospital and "|" in cleaned_hospital:
+        provider_kw = re.compile(
+            r"(?:hospital(?:s)?|maternity|clinic|nursing|institute|center|centre|netaralay|dispensary|health\s*care|medical\s*(?:centre|center))",
+            re.I,
+        )
+        for seg in cleaned_hospital.split("|"):
+            seg = seg.strip()
+            if seg and provider_kw.search(seg):
+                cleaned_hospital = seg
+                break
+    add_field("hospital_name", cleaned_hospital, model_version)
     add_field("admission_date", extraction.admission_date, model_version)
     add_field("discharge_date", extraction.discharge_date, model_version)
     add_field("diagnosis", extraction.primary_diagnosis, model_version)
@@ -1112,14 +1429,16 @@ _PAT_PRINCIPAL_DIAG_ROW = re.compile(
 )
 
 _PAT_PATIENT_NAME = re.compile(
-    r"(?:patient\s*(?:'s\s*)?name|name\s*of\s*(?:the\s*)?patient|pt\s*name)\s*[:\-]?\s*([^\n\r|]+?)(?=\s+(?:date\s*of\s*birth|dob|gender|age|address|phone|email|member\s*id|policy\s*number|ip\s*/?\s*mrn\s*no|mrn\s*no|uhid|patient\s*id|prescriber|ordering\s*doctor|doctor)\b|$)",
+    # Negative lookbehinds prevent matching labels like "TPA Name:", "Insurer Name:",
+    # "Hospital Name:", "Group Name:", etc. as patient_name.
+    r"(?:(?:patient|pt)\s*(?:'s\s*)?name|name\s*of\s*(?:the\s*)?patient|(?<!hospital\s)(?<!test\s)(?<!drug\s)(?<!father\s)(?<!mother\s)(?<!spouse\s)(?<!doctor\s)(?<!tpa\s)(?<!insurer\s)(?<!insurance\s)(?<!group\s)(?<!company\s)(?<!provider\s)(?<!nominee\s)(?<!proposer\s)(?<!policy\s)(?<!user\s)\bname\b)(?:[ \t]*[:\-]+(?:[ \t]*\n[ \t]*)?|[ \t]*\n[ \t]*|[ \t]+)([^\n\r|]+?)(?=\s+(?:date\s*of\s*birth|dob|gender|age|sex|address|phone|email|member\s*id|policy\s*number|ip\s*/?\s*mrn\s*no|mrn\s*no|uhid|patient\s*id|prescriber|ordering\s*doctor|doctor|dr\.?|reg|date)(?:\b|_)|[\n|]|$)",
     re.I,
 )
 _PAT_DOB = re.compile(
     r"(?:date\s*of\s*birth|dob|d\.o\.b|birth\s*date)\s*[:\-]?\s*([0-3]?\d(?:[\-/\.](?:[A-Za-z]{3,9}|\d{1,2})[\-/\.]\d{2,4}|[-\s][A-Za-z]{3,9}[-\s]\d{2,4}))", re.I
 )
 _PAT_AGE = re.compile(
-    r"(?i)(?:patient\s*age|age\s*/\s*(?:sex|gender)|age\s*(?:/\s*gender)?|\bage\b)\s*[:\-]\s*(\d{1,3})(?:\s*(?:years?|yrs?|y)\b)?(?:\s*[/,\-]\s*(?:male|female|m|f|other|transgender)\b)?"
+    r"(?i)(?:patient\s*age|age\s*/\s*(?:sex|gender)|age\s*(?:/\s*gender)?|\bage\b)\s*[:\-.]?\s*(\d{1,3})(?:\s*(?:years?|yrs?|y)\b)?(?:\s*[/,\-]\s*(?:male|female|m|f|other|transgender)\b)?"
 )
 _PAT_GENDER = re.compile(
     r"(?:gender|sex|age\s*/\s*gender)\s*[:\-]?\s*(?:\d{1,3}\s*[/\-]\s*)?(male|female|m|f|other|transgender)", re.I
@@ -1131,7 +1450,9 @@ _PAT_PHONE = re.compile(
     r"(?:phone|mobile|contact\s*(?:no|number)|tel)\s*[:\-]?\s*([\d\+\-\(\)\s]{7,15})", re.I
 )
 _PAT_EMAIL = re.compile(
-    r"(?:email|e-mail)\s*[:\-]?\s*([\w\.\-]+@[\w\.\-]+\.\w+)", re.I
+    # Domain must end with a real TLD; no whitespace inside the address (which
+    # used to swallow the next OCR line, e.g. "foo@bar.com\nBlood Group: A-").
+    r"(?:email|e-mail)\s*[:\-]?\s*([\w\.\-]+@[\w\.\-]+\.[A-Za-z]{2,})", re.I
 )
 _PAT_PATIENT_ID = re.compile(
     r"(?:patient\s*id|patient\s*no|uhid|mr\s*no|mrd\s*no|ipd\s*no)\s*[:\-]?\s*([\w\-/]+)", re.I
@@ -1159,7 +1480,7 @@ _PAT_INSURER = re.compile(
 
 # ---- Clinical / diagnosis ----
 _PAT_DIAGNOSIS = re.compile(
-    r"(?im)(?:(?:primary|principal|final|provisional|admitting|discharge)\s+)?(?<!secondary\s)diagnosis\s*[:\-]\s*([^\n\r|]+?)(?=\s+(?:secondary\s+diagnosis|icd(?:-?10)?\s*code|procedure|treatment|admission|discharge|total\s*amount)\b|$)",
+    r"(?im)(?:(?:primary|principal|final|provisional|admitting|discharge)\s+)?(?<!secondary\s)diagnosis\s*[:\-/]\s*([^\n\r|]+?)(?=\s+(?:secondary\s+diagnosis|icd(?:-?10)?\s*code|procedure|treatment|admission|discharge|total\s*amount)\b|$)",
     re.I | re.M,
 )
 _PAT_ICD_CODE = re.compile(r"\b([A-TV-Z]\d{2}(?:\.\d{1,4})?)\b")
@@ -1182,7 +1503,7 @@ _PAT_HISTORY = re.compile(
 
 # ---- Financial / billing ----
 _PAT_TOTAL_AMOUNT = re.compile(
-    r"(?:total\s*(?:amount|charge|cost|billed|bill|payable|hospital\s*expenses|claimed\s*amount)|grand\s*total|net\s*(?:amount|payable)|claim\s*amount\s*requested)\s*[:\-]?\s*(?:(?:rs|inr|usd|\$|₹)\.?\s*)?([\d,]+\.?\d*)",
+    r"(?:(?:total|gross\s*total)\s*(?:amount|charge|cost|billed|bill|payable|hospital\s*expenses|claimed\s*amount)|(?:total\s*)?gross\s*(?:total\s*)?amount|grand\s*total|net\s*(?:amount|payable)|claim\s*amount\s*requested)\s*[:\-]?\s*(?:(?:rs|inr|usd|\$|₹)\.?\s*)?([\d,]+\.?\d*)",
     re.I,
 )
 _PAT_ROOM_CHARGE = re.compile(
@@ -1237,7 +1558,7 @@ _PAT_HOSPITAL = re.compile(
     re.I,
 )
 _PAT_DOCTOR = re.compile(
-    r"(?:(?:treating|attending|consulting)\s*(?:doctor|physician)|dr\.?\s*name|doctor\s*(?:name)?|physician)\s*[:\-]?\s*([^\n\r|]+?)(?=\s+(?:registration|reg\.?\s*no|speciality|specialty|department|contact|phone|admission|discharge)\b|\n|$)",
+    r"(?:(?:treating|attending|consulting|referring)\s*(?:doctor|physician)|dr\.?\s*name|doctor\s*(?:name)?|physician|consultant)\s*[:\-|]?\s*(?:dr\.?\s*)?([^\n\r|]+?)(?=\s+(?:registration|reg\.?\s*(?:no|number)|speciality|specialty|department|contact|phone|admission|discharge|sr\.?\s*no_?|days|qty|total|charges|description)(?:\b|_)|[\n|]|$)",
     re.I,
 )
 _PAT_REG_NO = re.compile(
@@ -1346,18 +1667,83 @@ _SECTION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 
 def _normalize_amount(raw: str) -> str:
-    """Normalize currency amounts: remove commas, ensure decimal format."""
-    cleaned = raw.replace(",", "").strip()
-    # Ensure it looks like a number
+    """Normalize currency amounts while rejecting malformed OCR artifacts."""
+    cleaned = raw.strip()
+    if not cleaned:
+        return cleaned
+
+    # Accept normal currency forms such as 25,000 / 3.187 / 43.140 / 99,200.50.
+    # Reject malformed OCR combinations such as 43,.140 or 3..187 instead of
+    # coercing them into the wrong amount.
+    if not re.fullmatch(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?", cleaned):
+        return cleaned
+
+    normalized = cleaned.replace(",", "")
     try:
-        val = float(cleaned)
-        return f"{val:.2f}"
+        val = float(normalized)
     except ValueError:
         return cleaned
 
+    # Preserve true decimals such as 3.187 while still normalizing integers to two decimals.
+    if "." in normalized and len(normalized.split(".", 1)[1]) > 2:
+        return str(val)
+    return f"{val:.2f}"
+
+
+def _parse_amount(raw: str) -> Optional[float]:
+    normalized = _normalize_amount(raw)
+    if normalized == raw.strip() and not re.fullmatch(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?", raw.strip()):
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _normalize_expense_label(label: str) -> str:
+    normalized = re.sub(r"\s+", " ", label.lower().strip())
+    normalized = re.sub(r"^[\d\-\.\)\(\s]+", "", normalized)
+    normalized = re.sub(r"\b(?:charges?|charge|amount|rs|inr)\b", "", normalized)
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    if not normalized:
+        return normalized
+
+    alias_map = {
+        "admin food transport": "miscellaneous",
+        "food transport": "miscellaneous",
+        "admin food transpon": "miscellaneous",
+        "surgical consumables iv lines": "surgical consumables",
+        "surgical consumable iv lines": "surgical consumables",
+        "consumables": "consumables",
+        "surgical consumables": "consumables",
+        "consumable": "consumables",
+        "miscellaneous": "miscellaneous",
+        "misc": "miscellaneous",
+        "other": "miscellaneous",
+        "consultation": "consultation",
+        "consultation fee": "consultation",
+        "consultation charges": "consultation",
+        "room": "room charges",
+        "room rent": "room charges",
+        "room charges": "room charges",
+        "pharmacy": "pharmacy",
+        "medicine": "pharmacy",
+        "medicines": "pharmacy",
+        "nursing": "nursing",
+        "nursing care": "nursing",
+        "laboratory": "laboratory",
+        "lab": "laboratory",
+        "procedure": "procedure",
+    }
+
+    return alias_map.get(normalized, normalized)
+
 
 _CPT_REJECT_CONTEXT = re.compile(
-    r"(?:phone|mobile|contact|claim\s*ref|claim\s*no|authorization|auth\.?\s*no|reg\.?\s*no|invoice|bill\s*no|policy|member|aadhaar|receipt|ip\s*/\s*mrn|mrn)",
+    r"(?:phone|mobile|contact|claim\s*ref|claim\s*no|authorization|auth\.?\s*no|reg\.?\s*no|invoice|bill\s*no|policy|member|aadhaar|receipt|ip\s*/\s*mrn|mrn|charges?|total|amount|rs|inr|deposits?|payable|balance|paid|price|qty|quantity|rate"
+    r"|address|street|road|lane|nagar|colony|sector|pin\s*code|postcode|zip|state|city|district|massachusetts|california|texas|florida|maharashtra|karnataka|tamil\s*nadu|kerala|delhi|mumbai|bangalore|chennai|hyderabad)",
     re.I,
 )
 
@@ -1407,7 +1793,11 @@ def _extract_hospital_name_fallback(text: str) -> Optional[str]:
         if not line:
             continue
         low = line.lower()
-        if "hospital" not in low:
+        # Look for any provider/institution keywords (broader than just 'hospital')
+        if not any(tok in low for tok in (
+            "hospital", "maternity", "clinic", "home", "centre", "center",
+            "institute", "netaralay", "nursing", "care", "dispensary", "health",
+        )):
             continue
         if any(tok in low for tok in (
             "hospital course", "hospitalization", "inpatient hospital bill",
@@ -1417,6 +1807,19 @@ def _extract_hospital_name_fallback(text: str) -> Optional[str]:
 
         # Keep only the hospital title segment before obvious address/noise suffixes.
         candidate = line.split("+")[0].strip()
+        # Many claim form headers render as "<Hospital Name> | <Claim Ref> | <Status>".
+        # Pick the pipe-delimited segment that actually contains a provider keyword;
+        # otherwise the whole line (with claim refs, statuses, etc.) gets stored as
+        # the hospital_name.
+        if "|" in candidate:
+            segments = [seg.strip() for seg in candidate.split("|") if seg.strip()]
+            provider_re = re.compile(
+                r"(?:hospital(?:s)?|maternity|clinic|nursing|institute|center|centre|netaralay|dispensary|health\s*care|medical\s*(?:centre|center))",
+                re.I,
+            )
+            picked = next((seg for seg in segments if provider_re.search(seg)), None)
+            if picked:
+                candidate = picked
         if "," in candidate:
             left, right = candidate.split(",", 1)
             if re.search(r"\d", right):
@@ -1425,9 +1828,11 @@ def _extract_hospital_name_fallback(text: str) -> Optional[str]:
 
         if not re.search(r"[A-Za-z]", candidate):
             continue
-        if len(candidate) < 8 or len(candidate) > 80:
+        # Accept reasonably short provider names (e.g., 'Aniket Netaralay')
+        if len(candidate) < 4 or len(candidate) > 120:
             continue
-        if not re.search(r"hospital(?:s)?", candidate, re.I):
+        # Ensure candidate contains at least one provider-like token
+        if not re.search(r"(?:hospital(?:s)?|maternity|clinic|nursing|care|institute|center|centre|netaralay|dispensary|health)", candidate, re.I):
             continue
         return candidate
     return None
@@ -1750,22 +2155,21 @@ def _extract_with_heuristic(page_objects: List[PageObject]) -> ParseOutput:
             procedure_section_text = _extract_procedure_section_text(text)
 
         # --- Expense table extraction ---
-        # Prioritize structured/semi-structured tables over regex noise.
-        # Build a CPT code blacklist from two sources:
-        #   1. Already-extracted CPT codes from previous pages
-        #   2. Pre-scan THIS page's text for "CPT: XXXXX" patterns
-        # This prevents 5-digit CPT codes (e.g., 38205, 96413) from being
-        # mistaken for rupee amounts in the expense extractor.
         known_cpt_codes = {
             f.field_value for f in fields if f.field_name == "cpt_code"
         }
-        # Pre-scan: find 5-digit numbers near "CPT" labels on this page
         for cpt_m in re.finditer(r"(?:CPT|cpt)\s*[:\-]?\s*(\d{5})\b", text):
             known_cpt_codes.add(cpt_m.group(1))
+
+        is_bill = page.document_type in {DocumentType.HOSPITAL_BILL.value, DocumentType.PHARMACY_INVOICE.value}
+        header_match = _EXPENSE_SECTION_HEADER.search(text)
         
-        expense_fields = _extract_expense_table(
-            text, page_num, page.detected_tables, known_cpt_codes
-        )
+        if is_bill or header_match:
+            expense_fields, line_items = _extract_expense_table(
+                text, page_num, page.detected_tables, known_cpt_codes
+            )
+        else:
+            expense_fields, line_items = [], []
         has_expense_table = len(expense_fields) > 0
         for ef in expense_fields:
             key = f"{ef.field_name}:{ef.field_value}:{page_num}"
@@ -1775,15 +2179,31 @@ def _extract_with_heuristic(page_objects: List[PageObject]) -> ParseOutput:
                 seen_fields[ef.field_name].add(key)
                 fields.append(ef)
 
+        if has_expense_table and line_items:
+            table_rows = []
+            for item in line_items:
+                table_rows.append([
+                    item.description,
+                    item.category or "",
+                    str(item.quantity) if item.quantity else "1.00",
+                    f"{item.unit_price:.2f}" if item.unit_price else (f"{item.amount:.2f}" if item.amount else ""),
+                    f"{item.amount:.2f}" if item.amount else ""
+                ])
+            tables.append({
+                "source_page": page_num,
+                "header": ["description", "category", "quantity", "unit_price", "amount"],
+                "rows": table_rows,
+                "row_count": len(table_rows),
+            })
+
         # --- Field extraction (Heuristic Regexes) ---
         for field_name, pattern in _PATTERNS:
             if not _field_allowed_for_doc(field_name, page.document_type):
                 continue
-            
+
             # If we found a valid expense table on this page, do NOT run noisy regexes for itemised amounts
             if has_expense_table and field_name in amount_fields and field_name not in {"total_amount", "claimed_total"}:
                 continue
-
 
             search_text = text
             if field_name in {"cpt_code", "procedure"}:
@@ -1800,8 +2220,41 @@ def _extract_with_heuristic(page_objects: List[PageObject]) -> ParseOutput:
 
                 line_context = _extract_line_for_match(search_text, match)
 
-                if field_name == "cpt_code" and not _is_medical_procedure_text(line_context):
-                    continue
+                # --- Enhanced field validation and post-processing ---
+                # Doctor name: must look like a person, not a table row
+                if field_name in {"treating_doctor", "doctor_name"}:
+                    if not re.search(r"[A-Za-z]{3,}", value) or re.search(r"total|charges?|amount|qty|days|description|category|grand|deposit|payable|room|summary|table|sr\b|sl\b|visit|medicine|head\s*of", value, re.I):
+                        continue
+                    # Avoid values that are mostly numbers or table-like
+                    if sum(c.isdigit() for c in value) > sum(c.isalpha() for c in value):
+                        continue
+
+                # Age: must be a reasonable number
+                if field_name == "age":
+                    try:
+                        age_val = int(re.sub(r"[^0-9]", "", value))
+                        if not (0 < age_val < 120):
+                            continue
+                        value = str(age_val)
+                    except:
+                        continue
+
+                # Hospital name: must contain 'hospital' and not be a table header
+                if field_name == "hospital_name":
+                    if not re.search(r"hospital|clinic|care|nursing|institute|center|maternity|netaralay", value, re.I):
+                        continue
+                    if re.search(r"charges?|amount|summary|table|room|total|bill|expense|category|date|sr\b|sl\b", value, re.I):
+                        continue
+
+                # Address: avoid over-extraction (should not contain diagnosis, summary, etc.)
+                if field_name == "address":
+                    if re.search(r"diagnosis|summary|charges?|amount|table|room|total|bill|expense|category|date|sr\b|sl\b", value, re.I):
+                        continue
+
+                # CPT code: only if context matches
+                if field_name == "cpt_code":
+                    if not re.search(r"cpt|procedure", line_context, re.I):
+                        continue
 
                 if not _is_valid_field_value(field_name, value, line_context, page.document_type):
                     continue
@@ -1828,7 +2281,6 @@ def _extract_with_heuristic(page_objects: List[PageObject]) -> ParseOutput:
                 )
 
         # Discharge summaries often provide principal diagnosis in a table row
-        # (e.g., "Principal | STEMI ... | I21.19") without "Diagnosis:" label.
         if page.document_type == DocumentType.DISCHARGE_SUMMARY.value:
             m_principal = _PAT_PRINCIPAL_DIAG_ROW.search(text)
             if m_principal:
@@ -1925,6 +2377,17 @@ def _extract_with_heuristic(page_objects: List[PageObject]) -> ParseOutput:
 
     _backfill_demographic_fields(page_objects, fields, seen_fields)
 
+    # Calculate implicit total amount if missing
+    if not any(f.field_name == "total_amount" for f in fields):
+        total = sum(float(f.field_value) for f in fields if f.field_name in amount_fields and f.field_name not in {"total_amount", "claimed_total"} and f.field_value)
+        if total > 0:
+            fields.append(FieldResult(
+                field_name="total_amount",
+                field_value=f"{total:.2f}",
+                source_page=1,
+                model_version="heuristic-v2"
+            ))
+
     return ParseOutput(
         fields=fields,
         tables=tables,
@@ -2020,7 +2483,7 @@ def _detect_sections(text: str, page_num: int) -> List[Dict[str, Any]]:
 # ------------------------------------------------------------------
 
 _EXPENSE_SECTION_HEADER = re.compile(
-    r"(?:(?:hospitali[sz]ation|hospital|medical|surgery|claimed)\s*(?:&\s*(?:surgery|treatment))?\s*)?(?:expense|billing|charges?|cost)\s*(?:summary|details?|breakdown|statement)?",
+    r"\b(?:(?:hospitali[sz]ation|hospital|medical|surgery|claimed)\s*(?:&\s*(?:surgery|treatment))?\s*)?(?:expense|billing|charges?|cost)\b\s*(?:summary|details?|breakdown|statement)?",
     re.I,
 )
 
@@ -2174,18 +2637,18 @@ _EXPENSE_CATEGORY_MAP: Dict[str, str] = {
     "stem cell": "transplant_charges",
     "bone marrow": "transplant_charges",
     "room rent": "room_charges",
+    "room charge": "room_charges",
     "hospital services": "nursing_charges",
     "surgeon": "surgeon_fees",
-    "professional": "surgeon_fees",
     "procedure": "surgery_charges",
     "surgery": "surgery_charges",
     "surgical": "surgery_charges",
     "anaesthesia": "anaesthesia_charges",
     "anesthesia": "anaesthesia_charges",
     "anaesthetist": "anaesthesia_charges",
-    "angio": "ot_charges",
+    "angio charge": "ot_charges",
     "cath lab": "ot_charges",
-    "theatre": "ot_charges",
+    "theatre charge": "ot_charges",
     "consumable": "consumables",
     "consumables": "consumables",
     "implant": "consumables",
@@ -2209,11 +2672,11 @@ _EXPENSE_CATEGORY_MAP: Dict[str, str] = {
     "nutrition": "misc_charges",
     "dietary": "misc_charges",
     "laboratory": "laboratory_charges",
-    "lab": "laboratory_charges",
-    "room": "room_charges",
-    "bed": "room_charges",
+    "lab charge": "laboratory_charges",
+    "lab test": "laboratory_charges",
+    "bed charge": "room_charges",
     "boarding": "room_charges",
-    "ward": "room_charges",
+    "ward charge": "room_charges",
     "nursing": "nursing_charges",
     "nurse": "nursing_charges",
     "pharmacy": "pharmacy_charges",
@@ -2223,15 +2686,18 @@ _EXPENSE_CATEGORY_MAP: Dict[str, str] = {
     "drug": "pharmacy_charges",
     "consultation": "consultation_charges",
     "consultations": "consultation_charges",
-    "doctor": "consultation_charges",
-    "physician": "consultation_charges",
+    "doctor fee": "consultation_charges",
+    "doctor charge": "consultation_charges",
+    "physician fee": "consultation_charges",
+    "physician charge": "consultation_charges",
     "icu": "icu_charges",
     "hdu": "icu_charges",
     "nicu": "icu_charges",
     "ambulance": "ambulance_charges",
     "miscellaneous": "misc_charges",
     "sundry": "misc_charges",
-    "blood": "blood_charges",
+    "blood product": "blood_charges",
+    "blood charge": "blood_charges",
     "platelet": "blood_charges",
     "prbc": "blood_charges",
     "plasma": "blood_charges",
@@ -2256,12 +2722,15 @@ _EXPENSE_CATEGORY_MAP: Dict[str, str] = {
     "attendant": "other_charges",
     "covid": "other_charges",
     "ppe": "other_charges",
-    "registration": "other_charges",
-    "admission": "other_charges",
+    "registration fee": "other_charges",
+    "registration charge": "other_charges",
+    "admission fee": "other_charges",
+    "admission charge": "other_charges",
     "documentation": "other_charges",
-    "admin": "other_charges",
+    "admin fee": "other_charges",
+    "admin charge": "other_charges",
     "infusion": "other_charges",
-    "other": "misc_charges",
+    "other charge": "misc_charges",
 }
 
 
@@ -2285,7 +2754,7 @@ def _categorise_expense(label: str) -> str:
     # If a line starts with "Laboratory Bone marrow...", we want "Laboratory" 
     # to win, not "Bone marrow" (which would map to transplant).
     for keyword, category in _EXPENSE_CATEGORY_MAP.items():
-        if low.startswith(keyword):
+        if re.match(rf"^{re.escape(keyword)}\b", low):
             return category
 
     # ── Pass 3: longest keyword first (prevents "ambulance" in description
@@ -2307,9 +2776,9 @@ def _categorise_expense(label: str) -> str:
 def _extract_expense_table(
     text: str,
     page_num: int,
-    tables: Optional[List[Dict[str, Any]]] = None,
+    tables: Optional[list[dict[str, Any]]] = None,
     known_cpt_codes: Optional[set[str]] = None,
-) -> List[FieldResult]:
+) -> tuple[list[FieldResult], list[BillingLineItem]]:
     """
     Detect billing / expense sections and parse individual line items.
     
@@ -2322,9 +2791,35 @@ def _extract_expense_table(
     _cpt_blacklist = known_cpt_codes or set()
 
     header_match = _EXPENSE_SECTION_HEADER.search(text)
-    section_text = text[header_match.start():] if header_match else text
+    if header_match:
+        start_idx = text.rfind('\n', 0, header_match.start())
+        start_idx = start_idx + 1 if start_idx != -1 else 0
+        section_text = text[start_idx:]
+    else:
+        # Do not parse the whole page as a bill if we cannot find a bill section header.
+        # That causes normal OCR lines such as addresses and hospital metadata to be
+        # misclassified as expense rows.
+        if not tables:
+            return [], []
+        section_text = text
 
-    table_items: List[Tuple[str, float]] = []
+    table_items: list[tuple[str, str, float]] = []
+    seen_expense_keys: set[tuple[str, float]] = set()
+
+    def add_expense_item(raw_label: str, category: str, amount: float) -> None:
+        # Hard cap implausible amounts: real per-line hospital bill rows are
+        # virtually never above ₹10M. Larger values are almost always SNOMED
+        # codes, CPT codes, registration numbers, or OCR run-on errors.
+        if amount <= 0 or amount > 10_000_000:
+            return
+        norm_label = _normalize_expense_label(raw_label)
+        if not norm_label:
+            return
+        key = (norm_label, round(amount, 2))
+        if key in seen_expense_keys:
+            return
+        seen_expense_keys.add(key)
+        table_items.append((raw_label, category, round(amount, 2)))
 
     # 1. Structural Tables Pass
     if tables:
@@ -2355,96 +2850,291 @@ def _extract_expense_table(
                 amount_match = re.search(r"\d[\d,]*\.?\d*", raw_amount)
                 if amount_match:
                     try:
-                        amt = float(_normalize_amount(amount_match.group(0)))
-                        if amt > 0:
+                        amt = _parse_amount(amount_match.group(0))
+                        if amt is not None and amt > 0:
                             cat = _categorise_expense(label)
-                            table_items.append((cat, round(amt, 2)))
+                            add_expense_item(label, cat, amt)
                     except: pass
 
-    # 2. Text-based fallback passes — ONLY if structural tables found NOTHING.
-    #    IMPORTANT: These are CASCADED — each pass only runs if the previous
-    #    found nothing. This prevents the same physical line from being matched
-    #    by multiple passes and producing 2×/3× inflated totals.
-    if not table_items:
-        # Pass 2a: Pipe-delimited lines (e.g., "| Room Charges | Rs. 21,000 |")
-        for line in section_text.splitlines():
-            if "|" not in line:
-                continue
-            cells = [c.strip() for c in line.split("|") if c.strip()]
-            if len(cells) < 2:
-                continue
-            try:
-                amt = float(_normalize_amount(cells[-1]))
-            except Exception:
-                continue
-            if amt <= 0:
-                continue
-            # CPT blacklist: skip if this amount is a known CPT code
-            if str(int(amt)) in _cpt_blacklist:
-                continue
-            lbl_idx = 1 if re.fullmatch(r"\d+", cells[0]) and len(cells) >= 3 else 0
-            lbl = cells[lbl_idx]
-            if re.search(r"\btotal\b|\bsum\b|\bpolicy\b|\bdate\b|\bsr\b|\bsl\b|\bhead\b|\bamount\b", lbl, re.I):
-                continue
-            if re.search(
-                r"(?:room|board|consult|doctor|physician|pharmacy|medicine|drug|investigation|diagnostic|lab|pathology|radiology|imaging|surge|procedure|operation|ot\b|angio|cath|endoscopy|consumable|disposable|nursing|icu|hdu|nicu|ambulance|misc|sundry|other|anaesth|physio|rehabilitation|rehab|dialysis|oxygen|diet|dietary|nutrition|food|registration|admin|attendant|ppe|blood|implant|isolation|transplant|chemo|stem|ecg|eeg|monitoring|cardiac|haematol|hematol|platelet|filgrastim|apheresis|conditioning|g-csf|injection)",
-                lbl, re.I,
-            ):
-                cat = _categorise_expense(lbl)
-                table_items.append((cat, round(amt, 2)))
+    # 2. Text-based fallback passes. Keep them running even if a partial table
+    #    was already found, because OCR often splits a single bill into mixed
+    #    structural and line-based fragments. Deduping prevents inflation.
+    bill_anchor_found = bool(header_match) or re.search(
+        r"\b(?:hospital expense breakdown|expense breakdown|bill details|itemized bill|charges break?down|billing details)\b",
+        section_text,
+        re.I,
+    )
+    if not bill_anchor_found and not table_items:
+        return [], []
 
-    if not table_items:
-        # Pass 2b: Standard regex — "Room Charges   21,000" (multi-space/tab separated)
-        for m in _EXPENSE_LINE.finditer(section_text):
-            label, raw_amount = m.groups()
-            if re.search(r"\btotal\b|\bsum\b|\bpolicy\b|\bdate\b|\bhead\b|\bamount\b", label, re.I):
-                continue
-            if not re.search(
-                r"(?:room|board|consult|doctor|physician|pharmacy|medication|investigation|diagnostic|lab|pathology|radiology|imaging|surge|procedure|operation|ot\b|angio|cath|endoscopy|consumable|disposable|nursing|icu|hdu|nicu|ambulance|misc|sundry|other|anaesth|physio|rehabilitation|rehab|dialysis|oxygen|diet|dietary|nutrition|food|registration|admin|attendant|ppe|blood|implant|isolation|transplant|chemo|stem|ecg|eeg|monitoring|cardiac|haematol|hematol|platelet|filgrastim|apheresis|conditioning|g-csf|injection)",
-                label, re.I,
-            ):
-                continue
-            try:
-                amt = float(_normalize_amount(raw_amount))
-                if amt > 0:
-                    # CPT blacklist: skip if this amount is a known CPT code
-                    if str(int(amt)) in _cpt_blacklist:
-                        continue
-                    table_items.append((_categorise_expense(label), round(amt, 2)))
-            except:
-                pass
+    # Pass 2a: Pipe-delimited lines (e.g., "| Room Charges | Rs. 21,000 |")
+    for line in section_text.splitlines():
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.split("|") if c.strip()]
+        if len(cells) < 2:
+            continue
+        try:
+            amt = _parse_amount(cells[-1])
+        except Exception:
+            continue
+        if amt is None or amt <= 0:
+            continue
+        # CPT blacklist: skip if this amount is a known CPT code
+        if str(int(amt)) in _cpt_blacklist:
+            continue
+        lbl_idx = 1 if re.fullmatch(r"\d+", cells[0]) and len(cells) >= 3 else 0
+        lbl = cells[lbl_idx]
+        if re.search(r"\btotal\b|\bsum\b|\bpolicy\b|\bdate\b|\bsr\b|\bsl\b|\bhead\b|\bamount\b", lbl, re.I):
+            continue
+        if re.search(
+            r"(?:room|board|consult|doctor|physician|pharmacy|medicine|drug|investigation|diagnostic|lab|pathology|radiology|imaging|surge|procedure|operation|ot\b|angio|cath|endoscopy|consumable|disposable|nursing|icu|hdu|nicu|ambulance|misc|sundry|other|anaesth|anesthe|physio|rehabilitation|rehab|dialysis|oxygen|diet|dietary|nutrition|food|registration|admin|attendant|ppe|blood|implant|isolation|transplant|chemo|stem|ecg|eeg|monitoring|cardiac|haematol|hematol|platelet|filgrastim|apheresis|conditioning|g-csf|injection)",
+            lbl, re.I,
+        ):
+            cat = _categorise_expense(lbl)
+            add_expense_item(lbl, cat, amt)
 
-    if not table_items:
-        # Pass 2c: Numbered-line fallback — "1 HDU Charges HDU – 2 Days ... 18,000"
-        _NUMBERED_LINE = re.compile(
-            r"^\d{1,3}\s+(.+?)\s+(\d[\d,]*\.?\d*)\s*$", re.M
+    # Pass 2b: Standard regex — "Room Charges   21,000" (multi-space/tab separated)
+    for m in _EXPENSE_LINE.finditer(section_text):
+        label, raw_amount = m.groups()
+        if re.search(r"\btotal\b|\bsum\b|\bpolicy\b|\bdate\b|\bhead\b|\bamount\b", label, re.I):
+            continue
+        if re.search(r"\b(?:address|phone|email|policy|member|hospital name|date of admission|date of discharge|patient name|doctor name|signature|claim|tpa|insured|gender|age|blood group)\b", label, re.I):
+            continue
+        if not re.search(
+            r"(?:room|board|consult|doctor|physician|pharmacy|medication|investigation|diagnostic|lab|pathology|radiology|imaging|surge|procedure|operation|ot\b|angio|cath|endoscopy|consumable|disposable|nursing|icu|hdu|nicu|ambulance|misc|sundry|other|anaesth|anesthe|physio|rehabilitation|rehab|dialysis|oxygen|diet|dietary|nutrition|food|registration|admin|attendant|ppe|blood|implant|isolation|transplant|chemo|stem|ecg|eeg|monitoring|cardiac|haematol|hematol|platelet|filgrastim|apheresis|conditioning|g-csf|injection)",
+            label, re.I,
+        ):
+            continue
+        try:
+            amt = _parse_amount(raw_amount)
+            if amt is not None and amt > 0:
+                # CPT blacklist: skip if this amount is a known CPT code
+                if str(int(amt)) in _cpt_blacklist:
+                    continue
+                add_expense_item(label, _categorise_expense(label), round(amt, 2))
+        except:
+            pass
+
+    # Pass 2c: Numbered-line fallback — "1 HDU Charges HDU – 2 Days ... 18,000"
+    _NUMBERED_LINE = re.compile(
+        r"^\d{1,3}\s+(.+?)\s+(\d[\d,]*\.?\d*)\s*$", re.M
+    )
+    for m in _NUMBERED_LINE.finditer(section_text):
+        full_label, raw_amount = m.groups()
+        if re.search(r"\btotal\b|\bsum\b|\bpolicy\b|\bdate\b|\bhead\b|\bamount\b", full_label, re.I):
+            continue
+        if re.search(r"\b(?:address|phone|email|policy|member|hospital name|date of admission|date of discharge|patient name|doctor name|signature|claim|tpa|insured|gender|age|blood group)\b", full_label, re.I):
+            continue
+        try:
+            amt = _parse_amount(raw_amount)
+            if amt is not None and amt > 0:
+                # CPT blacklist: skip if this amount is a known CPT code
+                if str(int(amt)) in _cpt_blacklist:
+                    continue
+                cat = _categorise_expense(full_label)
+                add_expense_item(full_label, cat, amt)
+        except:
+            pass
+
+    # Pass 2d: PaddleOCR parallel lines (Labels on one line, amounts on next few lines)
+    lines = section_text.splitlines()
+    for i in range(len(lines) - 1):
+        lbl_line = lines[i].strip()
+        labels = [lbl.strip() for lbl in re.split(r"(?<=\bCHARGES\b)|(?<=\bFEE\b)|(?<=\bFEES\b)", lbl_line, flags=re.I) if lbl.strip()]
+        if len(labels) < 2:
+            continue
+        
+        # Scan ahead up to 5 lines for a matching array of numbers
+        found_nums = []
+        for j in range(1, min(6, len(lines) - i)):
+            val_line = lines[i+j]
+            
+            # Match a sequence of numbers separated ONLY by spaces
+            pattern = r"((?:\b\d[\d,]*\.?\d*\b\s+){" + str(len(labels) - 1) + r"}\b\d[\d,]*\.?\d*\b)"
+            match = re.search(pattern, val_line)
+            if match:
+                nums = [n for n in (_parse_amount(n) for n in re.findall(r"\b\d[\d,]*\.?\d*\b", match.group(1))) if n is not None]
+                if len(nums) == len(labels):
+                    found_nums = nums
+                    break
+        
+        # Use zip to map the numbers to labels, assuming they are ordered
+        if found_nums:
+            for j in range(len(labels)):
+                amt = found_nums[j]
+                if str(int(amt)) in _cpt_blacklist:
+                    continue
+                cat = _categorise_expense(labels[j])
+                add_expense_item(labels[j], cat, amt)
+
+    # Pass 2e: Alternating lines (Label on line 1, amount on line 2 or 3)
+    lines = section_text.splitlines()
+    for i, line in enumerate(lines):
+        lbl = line.strip()
+        if len(lbl) < 4:
+            continue
+        if re.search(r"\b(?:address|phone|email|policy|member|hospital name|date of admission|date of discharge|patient name|doctor name|signature|claim|tpa|insured|gender|age|blood group)\b", lbl, re.I):
+            continue
+        # Reject metadata-style labels that contain a doctor/treating-physician
+        # marker — these are name lines, not bill rows. Without this guard,
+        # "Treating Doctor: | Dr. Sha Nori" gets paired with the next OCR
+        # line ("Reg. No.: | MCI-24278") and the registration ID becomes a
+        # phantom expense.
+        if re.search(r"\b(?:treating\s*doctor|attending\s*doctor|consulting\s*doctor|doctor\s*name|physician\s*name|surgeon\s*name)\b", lbl, re.I):
+            continue
+        # Reject standalone "Procedure Code:" / "ICD Code:" labels — the next
+        # line is the code value, not a billed amount.
+        if re.fullmatch(r"\s*(?:procedure|cpt|icd(?:[-\s]?\d+)?|snomed|hcpcs|diagnosis)\s*code\s*:?\s*\|?\s*", lbl, re.I):
+            continue
+        if not re.search(
+            r"(?:room|board|consult|doctor|physician|pharmacy|medication|investigation|diagnostic|lab|pathology|radiology|imaging|surge|procedure|operation|ot\b|angio|cath|endoscopy|consumable|disposable|nursing|icu|hdu|nicu|ambulance|misc|sundry|other|anaesth|anesthe|physio|rehabilitation|rehab|dialysis|oxygen|diet|dietary|nutrition|food|registration|admin|attendant|ppe|blood|implant|isolation|transplant|chemo|stem|ecg|eeg|monitoring|cardiac|haematol|hematol|platelet|filgrastim|apheresis|conditioning|g-csf|injection)",
+            lbl, re.I,
+        ):
+            continue
+        if re.search(r"\btotal\b|\bsum\b|\bpolicy\b|\bdate\b|\bhead\b|\bamount\b", lbl, re.I):
+            continue
+
+        # If the label line itself already ends with an amount (e.g. itemised row
+        # "1 Room Charges Ward - 1 Days  2,500"), skip — Pass 2b/2c already
+        # captured it. Without this guard, Pass 2e walks to the *next* row and
+        # assigns row N+1's amount to row N's label (off-by-one cascade).
+        if re.search(r"\d[\d,]{2,}(?:\.\d+)?\s*$", lbl):
+            continue
+        # Skip MCI / registration / reg-no labels — they look "doctor-ish" but
+        # the trailing digits are an ID, not a billed amount.
+        if re.search(r"\b(?:mci\s*reg|registration\s*(?:no|number|#)|reg\.?\s*no|mci\b|imc\s*reg|mch\b)", lbl, re.I):
+            continue
+
+        for j in range(1, 3):
+            if i + j >= len(lines):
+                break
+            next_line = lines[i+j].strip()
+            # The next line must be a bare amount column, not another labelled
+            # field row. Lines like "MCI Reg No: TG-1997-33217" or
+            # "2 Procedure Charges Dental ... 14,953" contain non-amount text
+            # whose trailing digits would otherwise be mis-attributed to the
+            # current label.
+            if re.search(r"[A-Za-z]{4,}", next_line):
+                continue
+            clean_line = next_line.replace("{", "")
+            nums = [n for n in (_parse_amount(n) for n in re.findall(r"\b\d[\d,]*\.?\d*\b", clean_line)) if n is not None]
+            nums = [n for n in nums if n > 0]
+            # Reject implausible bill values: SNOMED/CPT codes and reg numbers
+            # routinely sit in the 7-9 digit range. Real per-line bill amounts
+            # almost never exceed 10 million (and usually under 1 million).
+            nums = [n for n in nums if n <= 10_000_000]
+            if nums:
+                amt = nums[-1]
+                if str(int(amt)) not in _cpt_blacklist:
+                    cat = _categorise_expense(lbl)
+                    add_expense_item(lbl, cat, amt)
+                break
+
+    # ------------------------------------------------------------------
+    # Smart consolidation: collapse near-duplicate rows that the multiple
+    # passes (structural table + pipe-delimited + numbered + alternating-line)
+    # all picked up. Two rows are considered the same line item when they
+    # share the same category AND the same amount; we keep the most
+    # descriptive label (longest after normalisation, breaking ties by
+    # alphabetical order to stay deterministic).
+    # ------------------------------------------------------------------
+    def _label_quality(label: str) -> tuple[int, int, int, str]:
+        """Higher-quality labels sort first.
+
+        - Prefer labels with more alpha words (more context).
+        - Prefer longer labels.
+        - Penalise labels that start with a digit prefix like "4 Pharmacy ..."
+          because that's the raw OCR row marker, not a clean category.
+        - Use the label string as a final tie-breaker for determinism.
+        """
+        words = re.findall(r"[A-Za-z]{2,}", label)
+        starts_with_digit = bool(re.match(r"^\s*\d+\b", label))
+        return (
+            0 if starts_with_digit else 1,
+            len(words),
+            len(label),
+            label,
         )
-        for m in _NUMBERED_LINE.finditer(section_text):
-            full_label, raw_amount = m.groups()
-            if re.search(r"\btotal\b|\bsum\b|\bpolicy\b|\bdate\b|\bhead\b|\bamount\b", full_label, re.I):
-                continue
-            try:
-                amt = float(_normalize_amount(raw_amount))
-                if amt > 0:
-                    # CPT blacklist: skip if this amount is a known CPT code
-                    if str(int(amt)) in _cpt_blacklist:
-                        continue
-                    cat = _categorise_expense(full_label)
-                    table_items.append((cat, round(amt, 2)))
-            except:
-                pass
 
-    summed_totals: dict[str, float] = {}
-    for cat, amt in table_items:
-        summed_totals[cat] = summed_totals.get(cat, 0.0) + amt
+    grouped: dict[tuple[str, float], list[tuple[str, str, float]]] = {}
+    order: list[tuple[str, float]] = []
+    for raw_label, cat, amt in table_items:
+        key = (cat, round(amt, 2))
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append((raw_label, cat, amt))
 
-    results: List[FieldResult] = []
-    for cat, total in summed_totals.items():
+    consolidated: list[tuple[str, str, float]] = []
+    for key in order:
+        items = grouped[key]
+        # Pick the best label among the duplicates.
+        best = max(items, key=lambda it: _label_quality(it[0]))
+        consolidated.append(best)
+
+    # Second pass: also collapse rows that share the same amount and whose
+    # normalised label tokens are a prefix-superset of one another. Different
+    # OCR passes often emit both the short header label ("Room Charges") and
+    # the verbose row label ("Room Charges Ward - 1 Days"). They can land in
+    # different categories (e.g. "room_charges" vs "other_charges" when a
+    # later word like "ward" trips the keyword map), so the (category, amount)
+    # key above won't catch them — but they're clearly the same line item.
+    def _norm_tokens(label: str) -> list[str]:
+        cleaned = re.sub(r"^\d{1,3}\s+", "", label.lower().strip())
+        return re.findall(r"[a-z]{2,}", cleaned)
+
+    by_amount: dict[float, list[int]] = {}
+    for idx, (lbl, _cat, amt) in enumerate(consolidated):
+        by_amount.setdefault(round(amt, 2), []).append(idx)
+
+    drop_idx: set[int] = set()
+    for amt, idxs in by_amount.items():
+        if len(idxs) < 2:
+            continue
+        # Pairwise: if one label's tokens are a strict prefix subset of the
+        # other's, drop the lower-quality one.
+        for a in idxs:
+            for b in idxs:
+                if a == b or a in drop_idx or b in drop_idx:
+                    continue
+                ta = _norm_tokens(consolidated[a][0])
+                tb = _norm_tokens(consolidated[b][0])
+                if not ta or not tb:
+                    continue
+                shorter, longer = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+                short_idx, long_idx = (a, b) if len(ta) <= len(tb) else (b, a)
+                if shorter == longer[: len(shorter)]:
+                    # Keep the more descriptive (longer-token) label.
+                    drop_idx.add(short_idx if len(shorter) < len(longer) else short_idx)
+
+    table_items = [item for i, item in enumerate(consolidated) if i not in drop_idx]
+
+    line_items: list[BillingLineItem] = []
+    results: list[FieldResult] = []
+    for raw_label, cat, amt in table_items:
+        desc = re.sub(r".*\b(?:description|particulars?|details?)\s*[:\-]?\s*", "", raw_label, flags=re.I).strip()
+        desc = re.sub(r"^(?:charges?)\s*[:\-]?\s*", "", desc, flags=re.I).strip()
+        if not desc:
+            desc = cat.replace("_", " ").title()
+
+        line_items.append(BillingLineItem(
+            description=desc,
+            category=cat,
+            quantity=1.0,
+            unit_price=amt,
+            amount=amt
+        ))
+        # Use the canonical category as the field_name so preview/UI sees a
+        # clean label like "Room Charges" instead of OCR-bloated rows like
+        # "Room Charges General Ward – 1 Days". The verbose description is
+        # preserved on the BillingLineItem above.
+        clean_field_name = cat.replace("_", " ").title()
         results.append(FieldResult(
-            field_name=cat,
-            field_value=f"{total:.2f}",
+            field_name=clean_field_name,
+            field_value=f"{amt:.2f}",
             source_page=page_num,
-            model_version="expense-table-v4"
+            model_version="expense-table-v6"
         ))
 
-    return results
+    return results, line_items
