@@ -52,3 +52,8 @@ models/xgb_feature_importance.json
 
 # RAG index binaries (regenerate via tmp/build_rag_index.py)
 services/coding/app/rag_data/
+
+# Local SQLite databases
+*.db
+*.sqlite
+*.sqlite3
