@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
+import "@/lib/demoClaims"; // installs demo fetch interceptor when AUTH_DEV_MODE
 
 /* ── Types ── */
 export interface AuthUser {

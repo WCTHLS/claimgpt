@@ -94,3 +94,51 @@ export function getDemoResponse(url: string): unknown | null {
   if (/\/claims\/[^/]+\/audit$/.test(path)) return { entries: [] };
   return null;
 }
+
+/** Full demo responder used by the global fetch shim (reads, writes, chat). */
+export function demoResponse(url: string, method: string, body?: string): unknown | null {
+  const path = url.split("?")[0];
+  const m = method.toUpperCase();
+  const read = getDemoResponse(url);
+  if (read != null) return read;
+  if (/\/claims\/[^/]+\/documents$/.test(path)) return { documents: [] };
+  if (/\/claims\/[^/]+\/expenses$/.test(path)) return { expenses: [], expense_total: 0 };
+  if (/\/providers$/.test(path)) return { current: "demo", providers: ["demo"] };
+  if (/\/search/.test(path)) return { results: CLAIMS.slice(0, 5) };
+  if (/\/chat$/.test(path) && m === "POST") {
+    let q = "your claim"; try { q = (JSON.parse(body || "{}").message || q).slice(0, 80); } catch {}
+    return { reply: `(demo) Based on the mock records, "${q}" is covered. ICD A09, billed within policy limits; no rejection flags.`, suggestions: ["Show diagnosis", "List documents", "Rejection risk?"] };
+  }
+  if (/\/claims$/.test(path) && m === "POST") {
+    const id = `demo-new-${Date.now().toString().slice(-4)}`;
+    return { id, status: "COMPLETED", created_at: new Date().toISOString(), documents: [] };
+  }
+  if (m !== "GET") return { ok: true }; // demo: writes succeed as no-ops
+  return null;
+}
+
+/** Wrap window.fetch: try the real backend first, fall back to mock data. */
+export function installDemoFetch(): void {
+  if (typeof window === "undefined" || !DEMO_AUTH) return;
+  const w = window as unknown as { __demoFetch?: boolean };
+  if (w.__demoFetch) return;
+  w.__demoFetch = true;
+  const real = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+    const method = init?.method || (typeof input !== "string" && !(input instanceof URL) ? (input as Request).method : "GET");
+    try {
+      const res = await real(input, init);
+      if (res.ok) return res;
+      const d = demoResponse(url, method, typeof init?.body === "string" ? init.body : undefined);
+      if (d != null) return new Response(JSON.stringify(d), { status: 200, headers: { "Content-Type": "application/json" } });
+      return res;
+    } catch (e) {
+      const d = demoResponse(url, method, typeof init?.body === "string" ? init.body : undefined);
+      if (d != null) return new Response(JSON.stringify(d), { status: 200, headers: { "Content-Type": "application/json" } });
+      throw e;
+    }
+  };
+}
+
+installDemoFetch();
