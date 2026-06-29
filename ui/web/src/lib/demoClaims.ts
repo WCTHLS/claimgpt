@@ -84,12 +84,28 @@ function previewFor(i: number) {
 const PREVIEWS: Record<string, ReturnType<typeof previewFor>> = {};
 CLAIMS.forEach((c, i) => { PREVIEWS[c.id] = previewFor(i); });
 
+// Claims created via demo upload (in-memory, this session).
+const EXTRA: DemoClaim[] = [];
+
+function genericPreview(id: string) {
+  return {
+    claim_id: id, status: "COMPLETED", policy_id: null,
+    summary: { patient_name: "Demo Patient", age: "40", gender: "Male", hospital: "Demo Hospital", doctor: "Dr. Demo", diagnosis: "General checkup", admission_date: "2026-06-01", discharge_date: "2026-06-03" },
+    billed_total: 50000,
+    icd_codes: [{ code: "Z00", description: "General exam" }],
+    cpt_codes: [{ code: "99213", description: "Office visit" }],
+    predictions: [{ rejection_score: 0.1, top_reasons: [{ reason: "Documentation complete", weight: 0.1 }] }],
+    validations: [{ rule_name: "Policy active", passed: true, message: "Within coverage", severity: "info" }],
+    documents: [],
+  };
+}
+
 /** Return mock JSON for a known read endpoint, or null if unmatched. */
 export function getDemoResponse(url: string): unknown | null {
   const path = url.split("?")[0];
-  if (/\/claims$/.test(path)) return { claims: CLAIMS };
+  if (/\/claims$/.test(path)) return { claims: [...EXTRA, ...CLAIMS] };
   const preview = path.match(/\/claims\/([^/]+)\/preview$/);
-  if (preview) return PREVIEWS[preview[1]] ?? null;
+  if (preview) return PREVIEWS[preview[1]] ?? genericPreview(preview[1]);
   if (/\/claims\/[^/]+\/progress$/.test(path)) return { is_complete: true, percentage: 100, status: "COMPLETED" };
   if (/\/claims\/[^/]+\/audit$/.test(path)) return { entries: [] };
   return null;
@@ -111,7 +127,9 @@ export function demoResponse(url: string, method: string, body?: string): unknow
   }
   if (/\/claims$/.test(path) && m === "POST") {
     const id = `demo-new-${Date.now().toString().slice(-4)}`;
-    return { id, status: "COMPLETED", created_at: new Date().toISOString(), documents: [] };
+    const now = new Date().toISOString();
+    EXTRA.unshift({ id, policy_id: `POL-NEW-${id.slice(-4)}`, patient_id: null, status: "COMPLETED", source: "demo", created_at: now, updated_at: now, documents: [] });
+    return { id, status: "COMPLETED", created_at: now, documents: [] };
   }
   if (m !== "GET") return { ok: true }; // demo: writes succeed as no-ops
   return null;
