@@ -218,7 +218,7 @@ export default function HomePage() {
       {/* Nav */}
       <nav className="lp-nav">
         <div className="lp-nav-inner">
-          <NavBrand><BrandMark /><span>claimgpt</span></NavBrand>
+          <NavBrand><BrandMark /><span>ClaimGPT</span></NavBrand>
           <div className="lp-nav-links"></div>
           <div className="lp-nav-actions">
             <Link className="lp-nav-ghost" href="/app">Sign in</Link>
@@ -426,7 +426,7 @@ export default function HomePage() {
       <footer className="lp-footer"><div className="lp-wrap">
         <div className="lp-foot-grid">
           <div className="lp-foot-co">
-            <div className="lp-foot-brand"><BrandMark /> claimgpt</div>
+            <div className="lp-foot-brand"><BrandMark /> ClaimGPT</div>
             <p className="lp-foot-desc">AI-powered healthcare claims intelligence for TPAs and insurers. Built by WaferWire Cloud Technologies.</p>
           </div>
           <div className="lp-foot-loc"><h4>US Office (HQ)</h4><span>4034 148th Ave NE</span><span>Redmond, WA — 98052</span><span>+1 425-484-3430</span></div>
