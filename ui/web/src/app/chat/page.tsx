@@ -173,7 +173,7 @@ export default function ChatPage() {
 
   return (
     <div className="container">
-      <a href="/" style={{ color: "var(--accent)", marginBottom: "1rem", display: "block" }}>← Home</a>
+      <a href="/app" style={{ color: "var(--accent)", marginBottom: "1rem", display: "block" }}>← Home</a>
       <h1 style={{ fontSize: "1.5rem", marginBottom: "0.5rem" }}>Chat Assistant</h1>
       <p style={{ color: "var(--muted)", marginBottom: "1rem", fontSize: "0.875rem" }}>
         Ask questions about your claims, billing, coding, or submission status
