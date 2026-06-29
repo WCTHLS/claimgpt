@@ -70,13 +70,18 @@ function previewFor(i: number) {
     summary: {
       patient_name: s.name, age: s.age, gender: s.gender, hospital: s.hospital,
       doctor: s.doctor, diagnosis: s.diagnosis, policy_number: CLAIMS[i].policy_id,
-      admission_date: "2026-05-10", discharge_date: "2026-05-14",
+      admission_date: "2026-05-10", discharge_date: "2026-05-14", total_amount: String(s.billed),
     },
+    parsed_fields: { patient_name: s.name, hospital: s.hospital, diagnosis: s.diagnosis, total_amount: String(s.billed), policy_number: CLAIMS[i].policy_id || "" },
     billed_total: s.billed,
-    icd_codes: [{ code: "A09", description: s.diagnosis }],
-    cpt_codes: [{ code: "99213", description: "Office visit" }],
-    predictions: [{ rejection_score: (i % 5) * 0.18, top_reasons: [{ reason: "Documentation complete", weight: 0.2 }] }],
+    icd_codes: [{ code: "A09", description: s.diagnosis, confidence: 0.93 }],
+    cpt_codes: [{ code: "99213", description: "Office visit", confidence: 0.88 }],
+    cost_summary: { icd_total: Math.round(s.billed * 0.6), cpt_total: Math.round(s.billed * 0.4), grand_total: s.billed },
+    expenses: [{ category: "Room", amount: Math.round(s.billed * 0.4) }, { category: "Pharmacy", amount: Math.round(s.billed * 0.35) }, { category: "Procedure", amount: Math.round(s.billed * 0.25) }],
+    expense_total: s.billed,
+    predictions: [{ rejection_score: (i % 5) * 0.18, top_reasons: [{ reason: "Documentation complete", weight: 0.2, feature: "docs" }], model_name: "demo" }],
     validations: [{ rule_name: "Policy active", passed: true, message: "Within coverage", severity: "info" }],
+    ocr_excerpt: `Patient ${s.name}, ${s.age}/${s.gender}. Dx: ${s.diagnosis}. Billed INR ${s.billed}.`,
     documents: CLAIMS[i].documents,
   };
 }
@@ -90,12 +95,17 @@ const EXTRA: DemoClaim[] = [];
 function genericPreview(id: string) {
   return {
     claim_id: id, status: "COMPLETED", policy_id: null,
-    summary: { patient_name: "Demo Patient", age: "40", gender: "Male", hospital: "Demo Hospital", doctor: "Dr. Demo", diagnosis: "General checkup", admission_date: "2026-06-01", discharge_date: "2026-06-03" },
+    summary: { patient_name: "Demo Patient", age: "40", gender: "Male", hospital: "Demo Hospital", doctor: "Dr. Demo", diagnosis: "General checkup", policy_number: null, admission_date: "2026-06-01", discharge_date: "2026-06-03", total_amount: "50000" },
+    parsed_fields: { patient_name: "Demo Patient", hospital: "Demo Hospital", diagnosis: "General checkup", total_amount: "50000", policy_number: "" },
     billed_total: 50000,
-    icd_codes: [{ code: "Z00", description: "General exam" }],
-    cpt_codes: [{ code: "99213", description: "Office visit" }],
-    predictions: [{ rejection_score: 0.1, top_reasons: [{ reason: "Documentation complete", weight: 0.1 }] }],
+    icd_codes: [{ code: "Z00", description: "General exam", confidence: 0.9 }],
+    cpt_codes: [{ code: "99213", description: "Office visit", confidence: 0.85 }],
+    cost_summary: { icd_total: 30000, cpt_total: 20000, grand_total: 50000 },
+    expenses: [{ category: "Room", amount: 20000 }, { category: "Pharmacy", amount: 18000 }, { category: "Procedure", amount: 12000 }],
+    expense_total: 50000,
+    predictions: [{ rejection_score: 0.1, top_reasons: [{ reason: "Documentation complete", weight: 0.1, feature: "docs" }], model_name: "demo" }],
     validations: [{ rule_name: "Policy active", passed: true, message: "Within coverage", severity: "info" }],
+    ocr_excerpt: "Demo Patient, 40/Male. Dx: General checkup. Billed INR 50000.",
     documents: [],
   };
 }
