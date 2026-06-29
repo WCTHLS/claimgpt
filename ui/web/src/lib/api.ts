@@ -2,6 +2,8 @@
  * Shared API helpers for the TPA UI.
  */
 
+import { DEMO_AUTH, getDemoResponse } from "./demoClaims";
+
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/ingress";
 export const SUBMISSION_API =
@@ -30,10 +32,25 @@ export async function apiFetch<T>(
   opts?: RequestInit & { token?: string | null },
 ): Promise<T> {
   const { token, ...init } = opts ?? {};
-  const res = await fetch(url, {
-    ...init,
-    headers: { ...authHeaders(token), ...(init.headers ?? {}) },
-  });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return res.json();
+  try {
+    const res = await fetch(url, {
+      ...init,
+      headers: { ...authHeaders(token), ...(init.headers ?? {}) },
+    });
+    if (!res.ok) {
+      if (DEMO_AUTH) {
+        const demo = getDemoResponse(url);
+        if (demo != null) return demo as T;
+      }
+      throw new Error(`${res.status} ${res.statusText}`);
+    }
+    return res.json();
+  } catch (err) {
+    // Backend unreachable on demo deploys → serve mock data for read endpoints.
+    if (DEMO_AUTH) {
+      const demo = getDemoResponse(url);
+      if (demo != null) return demo as T;
+    }
+    throw err;
+  }
 }

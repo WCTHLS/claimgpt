@@ -1,0 +1,96 @@
+/**
+ * Demo dataset for backend-less deploys (e.g. Vercel).
+ *
+ * Activated only when NEXT_PUBLIC_AUTH_DEV_MODE === "true" AND the real API is
+ * unreachable. apiFetch() and the home dashboard fall back to these 15 mock
+ * claims so the deployed app is browsable without a running backend.
+ */
+
+export const DEMO_AUTH = process.env.NEXT_PUBLIC_AUTH_DEV_MODE === "true";
+
+interface DemoDoc {
+  id: string;
+  file_name: string;
+  file_type?: string;
+}
+interface DemoClaim {
+  id: string;
+  policy_id: string | null;
+  patient_id: string | null;
+  status: string;
+  source: string | null;
+  created_at: string;
+  updated_at: string;
+  documents: DemoDoc[];
+}
+
+const SEED: Array<{
+  name: string; hospital: string; doctor: string; diagnosis: string;
+  age: string; gender: string; billed: number; status: string;
+}> = [
+  { name: "Rahul Sharma",     hospital: "Apollo Hospitals, Chennai",      doctor: "Dr. Meera Iyer",     diagnosis: "Acute appendicitis",            age: "34", gender: "Male",   billed: 84500,  status: "COMPLETED" },
+  { name: "Priya Nair",       hospital: "Fortis, Bengaluru",              doctor: "Dr. Suresh Rao",     diagnosis: "Type 2 diabetes mellitus",      age: "52", gender: "Female", billed: 41200,  status: "COMPLETED" },
+  { name: "Amit Verma",       hospital: "Max Super Specialty, Delhi",     doctor: "Dr. Kavita Singh",   diagnosis: "Coronary artery disease",       age: "61", gender: "Male",   billed: 312000, status: "COMPLETED" },
+  { name: "Sneha Patil",      hospital: "Manipal, Pune",                  doctor: "Dr. Arjun Desai",    diagnosis: "Normal delivery",               age: "28", gender: "Female", billed: 58900,  status: "PROCESSING" },
+  { name: "Vikram Reddy",     hospital: "KIMS, Hyderabad",                doctor: "Dr. Lakshmi Menon",  diagnosis: "Fracture of femur",             age: "45", gender: "Male",   billed: 167500, status: "COMPLETED" },
+  { name: "Anjali Gupta",     hospital: "Medanta, Gurugram",              doctor: "Dr. Rohit Malhotra", diagnosis: "Pneumonia",                     age: "39", gender: "Female", billed: 73400,  status: "COMPLETED" },
+  { name: "Karthik Subbu",    hospital: "Narayana, Bengaluru",            doctor: "Dr. Meera Iyer",     diagnosis: "Cataract surgery",              age: "67", gender: "Male",   billed: 29800,  status: "UPLOADED" },
+  { name: "Deepa Krishnan",   hospital: "AIIMS, Delhi",                   doctor: "Dr. Kavita Singh",   diagnosis: "Cholecystitis",                 age: "48", gender: "Female", billed: 95600,  status: "COMPLETED" },
+  { name: "Mohammed Irfan",   hospital: "CMC, Vellore",                   doctor: "Dr. Arjun Desai",    diagnosis: "Dengue fever",                  age: "31", gender: "Male",   billed: 38700,  status: "COMPLETED" },
+  { name: "Lakshmi Devi",     hospital: "Yashoda, Hyderabad",            doctor: "Dr. Suresh Rao",     diagnosis: "Hip replacement",               age: "70", gender: "Female", billed: 248000, status: "REVIEW" },
+  { name: "Sanjay Joshi",     hospital: "Ruby Hall, Pune",                doctor: "Dr. Rohit Malhotra", diagnosis: "Hernia repair",                 age: "55", gender: "Male",   billed: 64300,  status: "COMPLETED" },
+  { name: "Pooja Bansal",     hospital: "Fortis, Mumbai",                 doctor: "Dr. Lakshmi Menon",  diagnosis: "Asthma exacerbation",           age: "26", gender: "Female", billed: 21500,  status: "COMPLETED" },
+  { name: "Ravi Teja",        hospital: "Apollo, Hyderabad",              doctor: "Dr. Meera Iyer",     diagnosis: "Renal calculi",                 age: "42", gender: "Male",   billed: 112400, status: "PROCESSING" },
+  { name: "Nisha Menon",      hospital: "Aster, Kochi",                   doctor: "Dr. Kavita Singh",   diagnosis: "Thyroidectomy",                 age: "37", gender: "Female", billed: 87900,  status: "COMPLETED" },
+  { name: "Arun Pillai",      hospital: "Manipal, Bengaluru",             doctor: "Dr. Suresh Rao",     diagnosis: "Knee arthroscopy",              age: "33", gender: "Male",   billed: 76200,  status: "COMPLETED" },
+];
+
+const DAY = 86_400_000;
+const CLAIMS: DemoClaim[] = SEED.map((s, i) => {
+  const created = new Date(Date.now() - (i + 1) * DAY).toISOString();
+  const id = `demo-${String(i + 1).padStart(3, "0")}`;
+  return {
+    id,
+    policy_id: `POL-2026-${1000 + i}`,
+    patient_id: `PT-${2000 + i}`,
+    status: s.status,
+    source: "demo",
+    created_at: created,
+    updated_at: created,
+    documents: [{ id: `${id}-d1`, file_name: "discharge_summary.pdf", file_type: "application/pdf" }],
+  };
+});
+
+function previewFor(i: number) {
+  const s = SEED[i];
+  return {
+    claim_id: CLAIMS[i].id,
+    status: s.status,
+    policy_id: CLAIMS[i].policy_id,
+    summary: {
+      patient_name: s.name, age: s.age, gender: s.gender, hospital: s.hospital,
+      doctor: s.doctor, diagnosis: s.diagnosis, policy_number: CLAIMS[i].policy_id,
+      admission_date: "2026-05-10", discharge_date: "2026-05-14",
+    },
+    billed_total: s.billed,
+    icd_codes: [{ code: "A09", description: s.diagnosis }],
+    cpt_codes: [{ code: "99213", description: "Office visit" }],
+    predictions: [{ rejection_score: (i % 5) * 0.18, top_reasons: [{ reason: "Documentation complete", weight: 0.2 }] }],
+    validations: [{ rule_name: "Policy active", passed: true, message: "Within coverage", severity: "info" }],
+    documents: CLAIMS[i].documents,
+  };
+}
+
+const PREVIEWS: Record<string, ReturnType<typeof previewFor>> = {};
+CLAIMS.forEach((c, i) => { PREVIEWS[c.id] = previewFor(i); });
+
+/** Return mock JSON for a known read endpoint, or null if unmatched. */
+export function getDemoResponse(url: string): unknown | null {
+  const path = url.split("?")[0];
+  if (/\/claims$/.test(path)) return { claims: CLAIMS };
+  const preview = path.match(/\/claims\/([^/]+)\/preview$/);
+  if (preview) return PREVIEWS[preview[1]] ?? null;
+  if (/\/claims\/[^/]+\/progress$/.test(path)) return { is_complete: true, percentage: 100, status: "COMPLETED" };
+  if (/\/claims\/[^/]+\/audit$/.test(path)) return { entries: [] };
+  return null;
+}

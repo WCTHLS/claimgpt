@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, DragEvent, FormEvent } from "react";
 import { createPortal } from "react-dom";
 import { useAuth } from "@/lib/auth";
+import { DEMO_AUTH, getDemoResponse } from "@/lib/demoClaims";
 import { useI18n } from "@/lib/i18n";
 import UserAvatarDisplay from "@/components/UserAvatarDisplay";
 import LanguageSwitcher from "@/components/LanguageSwitcher";
@@ -616,7 +617,20 @@ export default function Home() {
           });
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        if (DEMO_AUTH) {
+          const d = getDemoResponse(`${API}/claims`) as { claims: Claim[] } | null;
+          if (d?.claims) {
+            setClaims(d.claims);
+            const names: Record<string, string> = {};
+            d.claims.forEach((c) => {
+              const p = getDemoResponse(`${SUBMISSION_API}/claims/${c.id}/preview`) as { summary?: { patient_name?: string } } | null;
+              if (p?.summary?.patient_name) names[c.id] = p.summary.patient_name;
+            });
+            setClaimNames((prev) => ({ ...prev, ...names }));
+          }
+        }
+      });
   };
 
   useEffect(() => {
