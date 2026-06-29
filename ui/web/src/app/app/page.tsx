@@ -1650,7 +1650,7 @@ export default function Home() {
         <div className="top-nav-left">
           <div className="top-nav-brand">
             <span className="brand-icon">
-              <svg width="28" height="28" viewBox="0 0 30 30" fill="none"><rect width="30" height="30" rx="7" fill="url(#brandbg)"/><path d="M15 7v16M7 15h16" stroke="#fff" strokeWidth="2.6" strokeLinecap="round"/><defs><linearGradient id="brandbg" x1="0" y1="0" x2="30" y2="30"><stop stopColor="#0f4c81"/><stop offset="1" stopColor="#0d9488"/></linearGradient></defs></svg>
+              <svg width="28" height="28" viewBox="0 0 64 68" fill="none"><path d="M2 6a4 4 0 0 1 4-4h36l18 18v44a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4z" fill="#0f4c81"/><path d="M42 2v14a4 4 0 0 0 4 4h14" fill="none" stroke="#fff" strokeWidth="2.5"/><rect x="12" y="30" width="34" height="4" rx="2" fill="#fff" opacity=".7"/><rect x="12" y="40" width="26" height="4" rx="2" fill="#fff" opacity=".5"/><path d="M46 44l3.5 8 8 3.5-8 3.5-3.5 8-3.5-8-8-3.5 8-3.5z" fill="#0d9488"/></svg>
             </span>
             <span className="brand-name">ClaimGPT</span>
           </div>

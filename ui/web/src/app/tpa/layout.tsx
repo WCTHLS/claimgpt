@@ -117,7 +117,7 @@ export default function TpaLayout({ children }: { children: React.ReactNode }) {
       <header className="tpa-topbar">
         <div className="tpa-topbar-left">
           <Link href="/tpa" className="tpa-logo">
-            <span className="tpa-logo-icon">⚕</span>
+            <span className="tpa-logo-icon"><svg width="20" height="20" viewBox="0 0 64 68" fill="none"><path d="M2 6a4 4 0 0 1 4-4h36l18 18v44a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4z" fill="#0f4c81"/><path d="M42 2v14a4 4 0 0 0 4 4h14" fill="none" stroke="#fff" strokeWidth="2.5"/><path d="M46 44l3.5 8 8 3.5-8 3.5-3.5 8-3.5-8-8-3.5 8-3.5z" fill="#0d9488"/></svg></span>
             <span>ClaimGPT <span className="tpa-logo-tag">TPA</span></span>
           </Link>
           <HeaderSearch search={search} setSearch={setSearch} suggestions={suggestions} />
