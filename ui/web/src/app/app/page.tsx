@@ -334,6 +334,12 @@ export default function Home() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
+
+  /* ── upload queue state machine hooks ── */
+  const [uploadQueue, setUploadQueue] = useState<File[]>([]);
+  const [currentlyUploadingFile, setCurrentlyUploadingFile] = useState<File | null>(null);
+  const [lastUploadedClaimId, setLastUploadedClaimId] = useState<string | null>(null);
+  const [queueTotalSize, setQueueTotalSize] = useState(0);
   // ...existing code...
   const [showPreview, setShowPreview] = useState(false);
   const [previewLoadingId, setPreviewLoadingId] = useState<string | null>(null);
@@ -826,9 +832,7 @@ export default function Home() {
   /* ── upload handler (XHR for progress, multi-file) ── */
   /* appendToActive=false → sidebar upload → always new claim */
   /* appendToActive=true  → chat attach/camera/screenshot → add to active claim */
-  const upload = (files: File[], appendToActive = false) => {
-    if (!files.length) return;
-    setUploadError(null);
+  const performUploadImmediate = (files: File[], appendToActive = false) => {
     setUploading(true);
     setUploadProgress(0);
     setUploadFiles(files);
@@ -900,29 +904,37 @@ export default function Home() {
             const label = count > 1 ? `${count} documents (${fname}, ...)` : `"${fname}"`;
             setMessages((prev) => [
               ...prev,
-              { role: "bot", text: claim.already_exists
-                ? `📄 **Report already generated** for ${label}. Opening the matching claim now.`
-                : `Claim with ${label} uploaded. Processing through AI pipeline (OCR > Parse > Code > Predict > Validate)...`
-              },
+              { role: "bot" as const, text: `✨ **New claim created** from ${label}. Starting inline processing pipeline...` },
             ]);
           }
+
+          if (!appendToActive) {
+            setLastUploadedClaimId(claim.id);
+          }
         } catch {
-          setUploadError("Invalid response from server.");
+          setUploadError("Failed to parse upload response");
+          if (!appendToActive) {
+            setLastUploadedClaimId(null);
+          }
         }
       } else {
         try {
           const err = JSON.parse(xhr.responseText);
-          const detail = String(err?.detail || "");
-          if (/low quality|clearer image|higher-quality pdf|too low for reliable extraction|unreadable OCR|trivial amount of text/i.test(detail)) {
-            setUploadError(
-              "OCR rejected this upload because the scan is not readable enough. Please re-upload the claim with a clearer image or higher-quality PDF."
-            );
+          const detail = err.detail || err.message;
+          if (Array.isArray(detail)) {
+            setUploadError(detail.map((d: any) => d.msg || JSON.stringify(d)).join(", "));
           } else {
             setUploadError(detail || `Upload failed (${xhr.status})`);
           }
         } catch {
           setUploadError(`Upload failed (${xhr.status})`);
         }
+        if (!appendToActive) {
+          setLastUploadedClaimId(null);
+        }
+      }
+      if (!appendToActive) {
+        setCurrentlyUploadingFile(null);
       }
     };
 
@@ -934,6 +946,53 @@ export default function Home() {
 
     xhr.send(fd);
   };
+
+  const performSingleUpload = (file: File) => {
+    performUploadImmediate([file], false);
+  };
+
+  const upload = (files: File[], appendToActive = false) => {
+    if (!files.length) return;
+    setUploadError(null);
+
+    if (appendToActive) {
+      performUploadImmediate(files, true);
+    } else {
+      setUploadQueue((prev) => {
+        const next = [...prev, ...files];
+        setQueueTotalSize((oldSize) => (prev.length === 0 ? files.length : oldSize + files.length));
+        return next;
+      });
+    }
+  };
+
+  /* ── Sequential Upload Queue Machine ── */
+  useEffect(() => {
+    if (currentlyUploadingFile !== null) return;
+
+    if (lastUploadedClaimId !== null) {
+      const targetClaim = claims.find((c) => c.id === lastUploadedClaimId);
+      const isStillProcessing = targetClaim && PIPELINE_ACTIVE_STATUSES.has(targetClaim.status) && targetClaim.id.length === 36;
+      if (isStillProcessing) {
+        return;
+      } else {
+        setLastUploadedClaimId(null);
+        return;
+      }
+    }
+
+    if (uploadQueue.length > 0) {
+      const isAnyClaimProcessing = claims.some((c) => PIPELINE_ACTIVE_STATUSES.has(c.status) && c.id.length === 36);
+      if (isAnyClaimProcessing) return;
+
+      const nextFile = uploadQueue[0];
+      setUploadQueue((prev) => prev.slice(1));
+      setCurrentlyUploadingFile(nextFile);
+      performSingleUpload(nextFile);
+    } else {
+      setQueueTotalSize(0);
+    }
+  }, [uploadQueue, currentlyUploadingFile, lastUploadedClaimId, claims]);
 
   /* ── drag handlers ── */
   const onDragOver = (e: DragEvent) => {
@@ -1638,6 +1697,10 @@ export default function Home() {
   if (!isAuthenticated) {
     return <SsoLoginScreen />;
   }
+
+  const isAnyClaimProcessing = claims.some((c) => PIPELINE_ACTIVE_STATUSES.has(c.status) && c.id.length === 36);
+  const isQueueActive = uploadQueue.length > 0 || currentlyUploadingFile !== null || lastUploadedClaimId !== null;
+  const isSystemBusy = isAnyClaimProcessing || isQueueActive;
 
   return (
     <div className="app-shell">
@@ -2905,34 +2968,67 @@ export default function Home() {
 
         {/* Drop zone */}
         <div
-          className={`drop-zone ${dragOver ? "drag-over" : ""}`}
-          onClick={() => fileRef.current?.click()}
-          onDragOver={onDragOver}
+          className={`drop-zone ${dragOver ? "drag-over" : ""} ${isSystemBusy ? "disabled" : ""}`}
+          onClick={() => {
+            if (isSystemBusy) return;
+            fileRef.current?.click();
+          }}
+          onDragOver={(e) => {
+            if (isSystemBusy) return;
+            onDragOver(e);
+          }}
           onDragLeave={onDragLeave}
-          onDrop={onDrop}
+          onDrop={(e) => {
+            if (isSystemBusy) return;
+            onDrop(e);
+          }}
         >
-          <div className="icon">
-            <svg width="42" height="42" viewBox="0 0 42 42" fill="none" xmlns="http://www.w3.org/2000/svg">
-              {/* Back doc */}
-              <rect x="10" y="4" width="24" height="30" rx="3" fill="var(--accent-lighter)" stroke="var(--accent)" strokeWidth="1.5" opacity="0.5"/>
-              {/* Middle doc */}
-              <rect x="6" y="8" width="24" height="30" rx="3" fill="var(--glass-bg)" stroke="var(--accent)" strokeWidth="1.5" opacity="0.75"/>
-              {/* Front doc */}
-              <rect x="2" y="12" width="24" height="30" rx="3" fill="white" stroke="var(--accent)" strokeWidth="1.5"/>
-              {/* Lines on front doc */}
-              <line x1="7" y1="20" x2="21" y2="20" stroke="var(--accent)" strokeWidth="1.2" strokeLinecap="round" opacity="0.5"/>
-              <line x1="7" y1="24" x2="18" y2="24" stroke="var(--accent)" strokeWidth="1.2" strokeLinecap="round" opacity="0.4"/>
-              <line x1="7" y1="28" x2="15" y2="28" stroke="var(--accent)" strokeWidth="1.2" strokeLinecap="round" opacity="0.3"/>
-              {/* Plus circle */}
-              <circle cx="32" cy="32" r="9" fill="var(--accent)" opacity="0.9"/>
-              <line x1="32" y1="27" x2="32" y2="37" stroke="white" strokeWidth="2" strokeLinecap="round"/>
-              <line x1="27" y1="32" x2="37" y2="32" stroke="white" strokeWidth="2" strokeLinecap="round"/>
-            </svg>
-          </div>
-          <p>
-            <strong>{t("drop.title")}</strong> {t("drop.or")}
-          </p>
-          <p className="hint">{t("drop.hint")}</p>
+          {isSystemBusy ? (
+            <div className="system-busy-display" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+              <div className="icon busy-spinner">
+                <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M21 12a9 9 0 11-6.219-8.56" />
+                </svg>
+              </div>
+              <p style={{ marginTop: "12px", color: "var(--accent)" }}>
+                <strong>
+                  {isQueueActive
+                    ? `Sequential Queue Active`
+                    : `Claim in Progress`}
+                </strong>
+              </p>
+              <p className="hint" style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "4px" }}>
+                {isQueueActive
+                  ? `Processing file ${queueTotalSize - uploadQueue.length} of ${queueTotalSize} (${currentlyUploadingFile ? currentlyUploadingFile.name : (claims.find(c => c.id === lastUploadedClaimId)?.documents?.[0]?.file_name || "waiting...")})`
+                  : `Please wait for the current claim pipeline to finish.`}
+              </p>
+            </div>
+          ) : (
+            <>
+              <div className="icon">
+                <svg width="42" height="42" viewBox="0 0 42 42" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  {/* Back doc */}
+                  <rect x="10" y="4" width="24" height="30" rx="3" fill="var(--accent-lighter)" stroke="var(--accent)" strokeWidth="1.5" opacity="0.5"/>
+                  {/* Middle doc */}
+                  <rect x="6" y="8" width="24" height="30" rx="3" fill="var(--glass-bg)" stroke="var(--accent)" strokeWidth="1.5" opacity="0.75"/>
+                  {/* Front doc */}
+                  <rect x="2" y="12" width="24" height="30" rx="3" fill="white" stroke="var(--accent)" strokeWidth="1.5"/>
+                  {/* Lines on front doc */}
+                  <line x1="7" y1="20" x2="21" y2="20" stroke="var(--accent)" strokeWidth="1.2" strokeLinecap="round" opacity="0.5"/>
+                  <line x1="7" y1="24" x2="18" y2="24" stroke="var(--accent)" strokeWidth="1.2" strokeLinecap="round" opacity="0.4"/>
+                  <line x1="7" y1="28" x2="15" y2="28" stroke="var(--accent)" strokeWidth="1.2" strokeLinecap="round" opacity="0.3"/>
+                  {/* Plus circle */}
+                  <circle cx="32" cy="32" r="9" fill="var(--accent)" opacity="0.9"/>
+                  <line x1="32" y1="27" x2="32" y2="37" stroke="white" strokeWidth="2" strokeLinecap="round"/>
+                  <line x1="27" y1="32" x2="37" y2="32" stroke="white" strokeWidth="2" strokeLinecap="round"/>
+                </svg>
+              </div>
+              <p>
+                <strong>{t("drop.title")}</strong> {t("drop.or")}
+              </p>
+              <p className="hint">{t("drop.hint")}</p>
+            </>
+          )}
           <input
             ref={fileRef}
             type="file"
@@ -2940,6 +3036,7 @@ export default function Home() {
             multiple
             accept=".pdf,.jpeg,.jpg,.png,.tiff,.tif,.bmp,.webp,.docx,.doc,.xlsx,.xls,.csv,.txt,.json,.xml,.html"
             onChange={(e) => {
+              if (isSystemBusy) return;
               const files = e.target.files;
               if (files?.length) upload(Array.from(files));
               e.target.value = "";
