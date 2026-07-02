@@ -336,7 +336,8 @@ export default function Home() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   // ...existing code...
   const [showPreview, setShowPreview] = useState(false);
-  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewLoadingId, setPreviewLoadingId] = useState<string | null>(null);
+  const previewLoading = previewLoadingId !== null;
   const [pdfPreviewUrl, setPdfPreviewUrl] = useState<string | null>(null);
   const [pdfDownloadUrl, setPdfDownloadUrl] = useState<string>("");
   const [pdfLoading, setPdfLoading] = useState(false);
@@ -468,7 +469,7 @@ export default function Home() {
     setPanelNotice(notice || null);
     setActiveClaim(claimId);
     setShowPreview(false);
-    setPreviewLoading(true);
+    setPreviewLoadingId(claimId);
     setPreview(null);
     setMessages([]);
     setUploadError(null);
@@ -487,7 +488,7 @@ export default function Home() {
       setPreview(null);
       setShowPreview(false);
     } finally {
-      setPreviewLoading(false);
+      setPreviewLoadingId(null);
     }
   }
 
@@ -1004,7 +1005,7 @@ export default function Home() {
 
   /* ── preview handler ── */
   const loadPreview = async (claimId: string) => {
-    setPreviewLoading(true);
+    setPreviewLoadingId(claimId);
     try {
       const resp = await fetch(`${SUBMISSION_API}/claims/${claimId}/preview`, { headers: authHeaders() });
       if (resp.ok) {
@@ -1036,7 +1037,7 @@ export default function Home() {
         }
       }
     } catch { /* ignore */ }
-    setPreviewLoading(false);
+    setPreviewLoadingId(null);
   };
 
   const saveEditedFields = async () => {
@@ -2768,7 +2769,7 @@ export default function Home() {
             </div>
             <div className="pdf-preview-body">
               <iframe
-                src={(pdfDownloadUrl || pdfPreviewUrl) + "#toolbar=1&navpanes=0"}
+                src={(pdfPreviewUrl ? pdfPreviewUrl + "#toolbar=1&navpanes=0" : "")}
                 className="pdf-preview-iframe"
                 title={pdfKind === "irda" ? "IRDA Claim Form Preview" : "TPA PDF Preview"}
               />
@@ -3110,12 +3111,12 @@ export default function Home() {
                     <input type="file" multiple hidden onChange={(e) => { if (e.target.files?.length) { setActiveClaim(c.id); upload(Array.from(e.target.files), true); } }} />
                     📎 Upload Documents
                   </label>
-                  <button className="preview-btn" onClick={(e) => { e.stopPropagation(); loadPreview(c.id); }}>👁 Preview</button>
+                  <button className="preview-btn" onClick={(e) => { e.stopPropagation(); loadPreview(c.id); }}>{previewLoadingId === c.id ? "Loading..." : "👁 Preview"}</button>
                 </div>
               )}
               {c.status === "MODIFICATION_REQUESTED" && (
                 <div className="claim-actions claim-actions-request">
-                  <button className="preview-btn preview-btn-edit" onClick={(e) => { e.stopPropagation(); loadPreview(c.id); }}>✏️ Edit & Preview</button>
+                  <button className="preview-btn preview-btn-edit" onClick={(e) => { e.stopPropagation(); loadPreview(c.id); }}>{previewLoadingId === c.id ? "Loading..." : "✏️ Edit & Preview"}</button>
                   <label className="upload-more-btn">
                     <input type="file" multiple hidden onChange={(e) => { if (e.target.files?.length) { setActiveClaim(c.id); upload(Array.from(e.target.files), true); } }} />
                     📎 Add Docs
@@ -3144,7 +3145,7 @@ export default function Home() {
                       loadPreview(c.id);
                     }}
                    >
-                    {previewLoading ? "Loading..." : "Preview"}
+                    {previewLoadingId === c.id ? "Loading..." : "Preview"}
                   </button>
                 </div>
               )}
