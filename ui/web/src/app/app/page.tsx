@@ -717,7 +717,7 @@ export default function Home() {
   useEffect(() => {
     if (pollingClaims.size === 0) return;
 
-    const id = setInterval(refreshClaimProgress, 1000);
+    const id = setInterval(refreshClaimProgress, 3000);
     return () => clearInterval(id);
   }, [pollingClaims]);
 
@@ -732,14 +732,14 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [claims]);
 
-  /* ── poll claim status updates at 2s intervals ── */
+  /* ── poll claim status updates at 5s intervals ── */
   useEffect(() => {
     const activeClaims = claims.filter((c) =>
       PIPELINE_ACTIVE_STATUSES.has(c.status)
     );
     if (activeClaims.length === 0) return;
 
-    const id = setInterval(refreshClaims, 2000);
+    const id = setInterval(refreshClaims, 5000);
     return () => clearInterval(id);
   }, [claims]);
 
