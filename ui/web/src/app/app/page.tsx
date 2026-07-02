@@ -653,7 +653,7 @@ export default function Home() {
 
   /* ── auto-refresh claim status every 5s while any claim is processing ── */
   const refreshClaimProgress = () => {
-    const activeClaims = claims.filter((c) => PIPELINE_ACTIVE_STATUSES.has(c.status));
+    const activeClaims = claims.filter((c) => PIPELINE_ACTIVE_STATUSES.has(c.status) && c.id.length === 36);
     activeClaims.forEach((claim) => {
       setPollingClaims((prev) => new Set(prev).add(claim.id));
       fetch(`${API}/claims/${claim.id}/progress?t=${Date.now()}`, { cache: "no-store" })
@@ -723,7 +723,7 @@ export default function Home() {
 
   /* ── bootstrap progress polling when active claims appear ── */
   useEffect(() => {
-    const active = claims.filter((c) => PIPELINE_ACTIVE_STATUSES.has(c.status));
+    const active = claims.filter((c) => PIPELINE_ACTIVE_STATUSES.has(c.status) && c.id.length === 36);
     if (active.length === 0) return;
     // Kick off an immediate fetch so the bar shows up without waiting for
     // the next interval tick. This also seeds `pollingClaims` so the
@@ -735,7 +735,7 @@ export default function Home() {
   /* ── poll claim status updates at 5s intervals ── */
   useEffect(() => {
     const activeClaims = claims.filter((c) =>
-      PIPELINE_ACTIVE_STATUSES.has(c.status)
+      PIPELINE_ACTIVE_STATUSES.has(c.status) && c.id.length === 36
     );
     if (activeClaims.length === 0) return;
 
